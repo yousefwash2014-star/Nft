@@ -32,7 +32,7 @@ def get_wallet_lock(address: str) -> threading.Lock:
 # ===========================================================================
 MAX_ETH_PER_TX = 0.02
 MAX_GAS_FEE_USD = 0.15
-MIN_BALANCE_RESERVE_USD = 0.001
+MIN_BALANCE_RESERVE_USD = 0.1
 GAS_LIMIT_SAFETY_MARGIN = 1.05
 FREE_PRICE_THRESHOLD_WEI = 1000
 
