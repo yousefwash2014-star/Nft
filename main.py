@@ -4,7 +4,7 @@
 - إعادة المحاولة للفاشلة كل 30 دقيقة
 - إعادة عرض الناجحة كل 4 ساعات
 - حد أقصى 50 رمز لكل عملية
-- إشعارات مفصلة لعملية العرض
+- الإشعارات: مفعلة
 """
 
 import asyncio
@@ -56,12 +56,17 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 log = logging.getLogger("main")
 
 # ===================================================================
+# 🔔 تشغيل/إيقاف الإشعارات
+# ===================================================================
+ENABLE_NOTIFICATIONS = True  # 🔥 True = تشغيل، False = إيقاف
+
+# ===================================================================
 # المتغيرات العامة
 # ===================================================================
 OPENSEA_API_KEY = os.environ.get("OPENSEA_API_KEY", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").strip().lower() == "true"
+BOT_ENABLED = os.environ.get("BOT_ENABLED", "true").strip().lower() == "true"
 
 # ===================================================================
 # نظام تيليجرام
@@ -72,36 +77,44 @@ sent = 0
 failed = 0
 
 def send_telegram(text: str):
+    """إرسال رسالة إلى تيليجرام."""
+    if not ENABLE_NOTIFICATIONS:
+        return
     if not text or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
         send_queue.put_nowait(text)
-    except:
-        pass
+        log.debug(f"📤 تم إضافة رسالة للطابور: {text[:50]}...")
+    except Exception as e:
+        log.error(f"❌ فشل إضافة رسالة للطابور: {e}")
 
-# فئات الإشعارات المختلفة
-SENT: Dict[str, Set[str]] = {
-    k: set() for k in [
-        "discovery", "result", "status", "retry", "soldout", 
-        "permanent", "progress", "listing", "listing_success",
-        "listing_failed", "listing_retry", "listing_relist"
-    ]
-}
+SENT: Dict[str, Set[str]] = {}
 
 def send_once(cat: str, key: str, text: str):
+    """إرسال رسالة مرة واحدة فقط (لمنع التكرار)."""
+    if not ENABLE_NOTIFICATIONS:
+        return
+    if not text or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    if cat not in SENT:
+        SENT[cat] = set()
     if key not in SENT[cat]:
         SENT[cat].add(key)
-        send_telegram(text)
+        try:
+            send_queue.put_nowait(text)
+            log.debug(f"📤 تم إضافة رسالة {cat} للطابور")
+        except Exception as e:
+            log.error(f"❌ فشل إضافة رسالة للطابور: {e}")
 
 async def telegram_worker(wid: int):
     global sent, failed
-    async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession() as session:
         while True:
             try:
                 text = await send_queue.get()
                 async with telegram_sem:
                     try:
-                        async with s.post(
+                        async with session.post(
                             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
                             data={
                                 "chat_id": TELEGRAM_CHAT_ID,
@@ -109,29 +122,38 @@ async def telegram_worker(wid: int):
                                 "parse_mode": "HTML",
                                 "disable_web_page_preview": False
                             },
-                            timeout=aiohttp.ClientTimeout(total=8)
+                            timeout=aiohttp.ClientTimeout(total=10)
                         ) as r:
                             if r.status == 200:
                                 sent += 1
+                                log.debug(f"✅ تم إرسال رسالة تيليجرام ({sent})")
                             elif r.status == 429:
-                                await asyncio.sleep(1)
+                                await asyncio.sleep(2)
                                 send_queue.put_nowait(text)
                             else:
                                 failed += 1
-                    except:
+                                log.warning(f"⚠️ فشل إرسال تيليجرام: HTTP {r.status}")
+                    except asyncio.TimeoutError:
+                        log.warning(f"⚠️ Timeout في إرسال تيليجرام")
+                        failed += 1
+                    except Exception as e:
+                        log.error(f"❌ خطأ في إرسال تيليجرام: {e}")
                         failed += 1
                     finally:
                         send_queue.task_done()
             except asyncio.CancelledError:
                 break
-            except:
-                await asyncio.sleep(0.5)
+            except Exception as e:
+                log.error(f"❌ خطأ في telegram_worker: {e}")
+                await asyncio.sleep(1)
 
 async def telegram_sender():
+    """مرسل تيليجرام - يشغل 5 عمال."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("⚠️ متغيرات تيليجرام غير مكتملة")
         while True:
             try:
-                t = await send_queue.get()
+                await send_queue.get()
                 send_queue.task_done()
             except:
                 await asyncio.sleep(1)
@@ -388,7 +410,7 @@ retry_lock = asyncio.Lock()
 mint_sem = asyncio.Semaphore(MAX_CONCURRENT_MINTS)
 
 # ===================================================================
-# رسائل النظام الأساسية
+# دوال بناء الرسائل
 # ===================================================================
 def build_discovery_msg(detail, cn, stages):
     name = detail.get("collection_name") or detail.get("collection_slug", "?")
@@ -423,7 +445,7 @@ def build_result_msg(detail, results, cn, sn):
     bad = [r for r in results if not r.success]
     
     lines = [
-        f"نتائج الشراء للمجموعة: {name}",
+        f"📊 نتائج الشراء للمجموعة: {name}",
         f"المرحلة: {sn} | السلسلة: {cd}\n",
         f"نجاح: {len(ok)} محفظة | فشل: {len(bad)} محفظة\n",
     ]
@@ -439,7 +461,7 @@ def build_result_msg(detail, results, cn, sn):
             reasons[reason] = reasons.get(reason, 0) + 1
         for reason, count in reasons.items():
             lines.append(f"  ❌ {reason}: {count} محفظة")
-    lines.append(f"\nرابط المجموعة: {url}")
+    lines.append(f"\n🔗 {url}")
     return "\n".join(lines)
 
 def build_success_msg(detail, result, cn):
@@ -480,154 +502,107 @@ def build_status_msg(wallet_name, detail, reason):
             f"ستتم إعادة المحاولة تلقائياً كل 3 ثواني"
         )
 
-# ===================================================================
-# رسائل عرض الرموز (الإشعارات الجديدة)
-# ===================================================================
-def build_listing_start_msg(wallet_name: str, chain_name: str, nft_contract: str, total_tokens: int) -> str:
-    """رسالة بدء عرض الرموز."""
-    cd = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
-    contract_short = f"{nft_contract[:10]}...{nft_contract[-6:]}"
-    
+def build_retry_start_msg(wallet_name, detail, reason):
+    name = detail.get("collection_name", "?")
     return (
-        f"📋 <b>بدء عرض الرموز في السوق</b>\n\n"
-        f"👛 المحفظة: {wallet_name}\n"
-        f"⛓️ السلسلة: {cd}\n"
-        f"📦 عقد NFT: {contract_short}\n"
-        f"🔢 عدد الرموز: {total_tokens}\n\n"
-        f"⏳ جاري العرض..."
+        f"🔄 بدء إعادة المحاولة\n\n"
+        f"المحفظة: {wallet_name}\n"
+        f"المجموعة: {name}\n"
+        f"سبب الفشل: {get_reason_text(reason)}\n"
+        f"مدة الانتظار بين المحاولات: 3 ثواني\n\n"
+        f"ستستمر المحاولات حتى النجاح أو نفاذ الكمية"
     )
 
-def build_listing_detail_msg(token_id: str, success: bool, tx_hash: str = "", reason: str = "", price_usd: float = 0) -> str:
-    """رسالة تفصيلية لعرض رمز واحد."""
-    status_icon = "✅" if success else "❌"
-    status_text = "تم العرض بنجاح" if success else "فشل العرض"
-    
-    if success:
-        return (
-            f"{status_icon} <b>{status_text}</b>\n"
-            f"🔢 الرمز: {token_id[:10]}...\n"
-            f"💲 السعر: ${price_usd:.6f}\n"
-            f"🔗 المعاملة: {tx_hash[:20]}..."
-        )
-    else:
-        return (
-            f"{status_icon} <b>{status_text}</b>\n"
-            f"🔢 الرمز: {token_id[:10]}...\n"
-            f"⚠️ السبب: {reason}"
-        )
+def build_soldout_msg(name):
+    return f"⛔ نفذت الكمية\n\nالمجموعة: {name}\n\nلم تعد هناك قطع متبقية للسك"
 
-def build_listing_summary_msg(results: Dict, chain_name: str, wallet_name: str) -> str:
-    """رسالة ملخص عرض الرموز."""
+def build_retry_progress_msg(wallet_name, name, attempt):
+    return (
+        f"📊 تحديث حالة إعادة المحاولة\n\n"
+        f"المحفظة: {wallet_name}\n"
+        f"المجموعة: {name}\n"
+        f"عدد المحاولات: {attempt}\n\n"
+        f"ما زالت المحاولات مستمرة..."
+    )
+
+def build_retry_success_msg(wallet_name, name, attempt, tx_hash, ex):
+    return (
+        f"✅ نجحت إعادة المحاولة!\n\n"
+        f"المحفظة: {wallet_name}\n"
+        f"المجموعة: {name}\n"
+        f"نجحت بعد {attempt} محاولة\n"
+        f"رابط المعاملة: {ex}{tx_hash}"
+    )
+
+def build_permanent_msg(wallet_name, reason_text):
+    return (
+        f"⛔ توقفت إعادة المحاولة - سبب دائم\n\n"
+        f"المحفظة: {wallet_name}\n"
+        f"السبب: {reason_text}\n\n"
+        f"لا يمكن متابعة المحاولات لهذا السبب"
+    )
+
+# ===================================================================
+# رسائل عرض الرموز
+# ===================================================================
+def build_listing_summary_msg(results, chain_name, wallet_name):
     cd = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
-    
     total = results.get("total_owned", 0)
     listed = results.get("total_listed", 0)
     failed = results.get("total_failed", 0)
-    
-    # حساب نسبة النجاح
-    success_rate = (listed / total * 100) if total > 0 else 0
-    
-    lines = [
-        f"📊 <b>ملخص عرض الرموز</b>\n",
-        f"👛 المحفظة: {wallet_name}",
-        f"⛓️ السلسلة: {cd}",
-        f"━━━━━━━━━━━━━━━━━━",
-        f"📦 إجمالي الرموز: {total}",
-        f"✅ تم العرض: {listed}",
-        f"❌ فشل العرض: {failed}",
-        f"📈 نسبة النجاح: {success_rate:.1f}%",
-    ]
-    
-    if results.get("details"):
-        lines.append("\n━━━━━━━━━━━━━━━━━━")
-        lines.append("📋 <b>تفاصيل العروض:</b>")
-        for d in results["details"][:10]:
-            status = "✅" if d.get("success") else "❌"
-            reason = d.get("reason", "نجاح")
-            lines.append(f"  {status} الرمز {d['token_id'][:8]}... - {reason}")
-        if len(results["details"]) > 10:
-            lines.append(f"  ... و {len(results['details']) - 10} أخرى")
-    
-    return "\n".join(lines)
+    return (
+        f"📋 عرض الرموز في السوق\n\n"
+        f"المحفظة: {wallet_name}\n"
+        f"السلسلة: {cd}\n"
+        f"إجمالي الرموز: {total}\n"
+        f"تم العرض: ✅ {listed}\n"
+        f"فشل العرض: ❌ {failed}"
+    )
 
-def build_listing_success_msg(token_id: str, tx_hash: str, price_usd: float, wallet_name: str, chain_name: str) -> str:
-    """رسالة نجاح عرض رمز."""
+def build_listing_success_msg(token_id, tx_hash, price_usd, wallet_name, chain_name):
     cd = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
     ex = CHAINS_CONFIG.get(chain_name, {}).get("explorer_url", "")
-    
     return (
-        f"✅ <b>تم عرض الرمز بنجاح!</b>\n\n"
-        f"👛 المحفظة: {wallet_name}\n"
-        f"⛓️ السلسلة: {cd}\n"
-        f"🔢 الرمز: {token_id[:10]}...\n"
-        f"💲 السعر: ${price_usd:.6f}\n"
-        f"🔗 المعاملة: {ex}{tx_hash}"
+        f"✅ تم عرض الرمز بنجاح!\n\n"
+        f"المحفظة: {wallet_name}\n"
+        f"السلسلة: {cd}\n"
+        f"الرمز: {token_id[:10]}...\n"
+        f"السعر: ${price_usd:.6f}\n"
+        f"رابط المعاملة: {ex}{tx_hash}"
     )
 
-def build_listing_failed_msg(token_id: str, reason: str, wallet_name: str, chain_name: str) -> str:
-    """رسالة فشل عرض رمز."""
+def build_listing_failed_msg(token_id, reason, wallet_name, chain_name):
     cd = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
     reason_text = get_reason_text(reason)
-    
     return (
-        f"❌ <b>فشل عرض الرمز</b>\n\n"
-        f"👛 المحفظة: {wallet_name}\n"
-        f"⛓️ السلسلة: {cd}\n"
-        f"🔢 الرمز: {token_id[:10]}...\n"
-        f"⚠️ السبب: {reason_text}\n\n"
-        f"🔄 سيتم إعادة المحاولة بعد 30 دقيقة"
+        f"❌ فشل عرض الرمز\n\n"
+        f"المحفظة: {wallet_name}\n"
+        f"السلسلة: {cd}\n"
+        f"الرمز: {token_id[:10]}...\n"
+        f"السبب: {reason_text}\n\n"
+        f"سيتم إعادة المحاولة بعد 30 دقيقة"
     )
 
-def build_listing_retry_msg(results: Dict, chain_name: str, wallet_name: str) -> str:
-    """رسالة إعادة محاولة عرض الرموز الفاشلة."""
+def build_listing_retry_msg(results, chain_name, wallet_name):
     cd = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
-    
-    retried = results.get("total_retried", 0)
-    success = results.get("total_success", 0)
-    failed = results.get("total_failed", 0)
-    
     return (
-        f"🔄 <b>إعادة محاولة عرض الرموز الفاشلة</b>\n\n"
-        f"👛 المحفظة: {wallet_name}\n"
-        f"⛓️ السلسلة: {cd}\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📊 تمت المحاولة: {retried}\n"
-        f"✅ نجاح: {success}\n"
-        f"❌ فشل: {failed}"
+        f"🔄 إعادة محاولة عرض الرموز الفاشلة\n\n"
+        f"المحفظة: {wallet_name}\n"
+        f"السلسلة: {cd}\n"
+        f"تمت المحاولة: {results.get('total_retried', 0)}\n"
+        f"نجاح: ✅ {results.get('total_success', 0)}\n"
+        f"فشل: ❌ {results.get('total_failed', 0)}"
     )
 
-def build_relist_msg(results: Dict, chain_name: str, wallet_name: str) -> str:
-    """رسالة إعادة عرض الرموز الناجحة (بعد 4 ساعات)."""
+def build_relist_msg(results, chain_name, wallet_name):
     cd = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
-    
-    relisted = results.get("total_relisted", 0)
-    success = results.get("total_success", 0)
-    failed = results.get("total_failed", 0)
-    
     return (
-        f"🔄 <b>إعادة عرض الرموز الناجحة</b>\n\n"
-        f"👛 المحفظة: {wallet_name}\n"
-        f"⛓️ السلسلة: {cd}\n"
-        f"⏱️ الفاصل: 4 ساعات\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📊 تمت إعادة العرض: {relisted}\n"
-        f"✅ نجاح: {success}\n"
-        f"❌ فشل: {failed}"
-    )
-
-def build_listing_stats_msg(stats: Dict) -> str:
-    """رسالة إحصائيات عروض الرموز."""
-    return (
-        f"📊 <b>إحصائيات عروض الرموز</b>\n\n"
-        f"📦 إجمالي الرموز: {stats['total']}\n"
-        f"✅ معروضة: {stats['success']}\n"
-        f"❌ فاشلة: {stats['failed']}\n"
-        f"⏳ في الانتظار: {stats['pending']}\n"
-        f"🔄 قيد إعادة المحاولة: {stats['retrying']}\n"
-        f"🔄 تحتاج إعادة عرض: {stats['relisting']}\n\n"
-        f"📦 الحد الأقصى للعرض: {stats['max_per_batch']}\n"
-        f"⏱️ إعادة محاولة الفاشلة: {stats['retry_interval_minutes']} دقيقة\n"
-        f"⏱️ إعادة عرض الناجحة: {stats['relist_interval_hours']} ساعات"
+        f"🔄 إعادة عرض الرموز الناجحة (بعد 4 ساعات)\n\n"
+        f"المحفظة: {wallet_name}\n"
+        f"السلسلة: {cd}\n"
+        f"تمت إعادة العرض: {results.get('total_relisted', 0)}\n"
+        f"نجاح: ✅ {results.get('total_success', 0)}\n"
+        f"فشل: ❌ {results.get('total_failed', 0)}"
     )
 
 # ===================================================================
@@ -726,7 +701,10 @@ async def process_wallet(session, slug, detail, stage, cn, wallet, ep, end_time=
             await update_balance(session, wa, cn)
             send_telegram(build_success_msg(detail, result, cn))
             
-            # عرض الرموز المملوكة في السوق بعد الشراء الناجح
+            # =============================================================
+            # 🔥 عرض الرموز المملوكة في السوق بعد الشراء الناجح
+            # =============================================================
+            log.info(f"📋 بدء عرض الرموز للمحفظة {wn} على {cn}")
             await list_owned_tokens(session, wallet, contract, cn)
             
         else:
@@ -856,37 +834,32 @@ async def retry_loop(session, tracker):
             return
 
 # ===================================================================
-# دوال عرض الرموز في السوق (مع إشعارات مفصلة)
+# 🚀 دوال عرض الرموز في السوق (المعدلة والمحسنة)
 # ===================================================================
 async def list_owned_tokens(session, wallet, nft_contract, chain_name):
-    """عرض جميع الرموز المملوكة للمحفظة في السوق مع إشعارات."""
+    """
+    عرض جميع الرموز المملوكة للمحفظة في السوق.
+    هذه الدالة تستدعى بعد كل عملية شراء ناجحة.
+    """
+    log.info(f"📋 [list_owned_tokens] بدء عرض الرموز للمحفظة {wallet['name']} على {chain_name}")
+    
     w3 = w3_instances.get(chain_name)
     if not w3:
+        log.error(f"❌ لا يوجد Web3 للسلسلة {chain_name}")
         return
     
     marketplace_address = CHAINS_CONFIG[chain_name].get("marketplace_address")
     if not marketplace_address:
         log.warning(f"⚠️ لا يوجد عنوان سوق لـ {chain_name}")
+        send_telegram(f"⚠️ لا يوجد عنوان سوق لـ {chain_name}")
         return
     
     eth_price_usd = await get_eth_price(session)
     
     try:
-        # الحصول على الرموز المملوكة أولاً لعرض العدد
-        from buyer import get_all_owned_tokens
-        token_ids = get_all_owned_tokens(w3, nft_contract, wallet["address"])
+        # تنفيذ العرض
+        log.info(f"📋 استدعاء list_all_owned_tokens للمحفظة {wallet['name']}")
         
-        if not token_ids:
-            log.info(f"ℹ️ لا توجد رموز مملوكة للمحفظة {wallet['name']} على {chain_name}")
-            return
-        
-        # إرسال إشعار بدء العرض
-        start_msg = build_listing_start_msg(
-            wallet["name"], chain_name, nft_contract, len(token_ids)
-        )
-        send_telegram(start_msg)
-        
-        # عرض الرموز
         results = await asyncio.to_thread(
             list_all_owned_tokens,
             w3=w3,
@@ -901,46 +874,51 @@ async def list_owned_tokens(session, wallet, nft_contract, chain_name):
             listing_manager=listing_manager,
         )
         
-        # إرسال إشعارات تفصيلية لكل رمز
-        if results.get("details"):
-            for detail in results["details"]:
+        log.info(f"📋 نتائج العرض: {results}")
+        
+        # إرسال النتائج
+        if results.get("total_owned", 0) > 0:
+            log.info(f"✅ تم عرض {results['total_listed']} رمز من {results['total_owned']}")
+            
+            # إرسال ملخص
+            summary_msg = build_listing_summary_msg(results, chain_name, wallet["name"])
+            send_telegram(summary_msg)
+            
+            # إرسال تفاصيل لكل رمز (حد 5 تفاصيل لتجنب السبام)
+            for idx, detail in enumerate(results.get("details", [])[:5]):
                 token_id = detail.get("token_id", "")
                 success = detail.get("success", False)
-                tx_hash = detail.get("tx_hash", "")
-                reason = detail.get("reason", "")
-                
-                # استخدام سعر العرض من النتائج
-                price_usd = 0
-                if listing_manager and token_id in listing_manager.listings:
-                    price_usd = listing_manager.listings[token_id].price_usd
                 
                 if success:
-                    msg = build_listing_success_msg(
-                        token_id, tx_hash, price_usd,
-                        wallet["name"], chain_name
-                    )
-                    send_once("listing_success", f"{token_id}_{chain_name}", msg)
+                    tx_hash = detail.get("tx_hash", "")
+                    price_usd = 0
+                    if listing_manager and token_id in listing_manager.listings:
+                        price_usd = listing_manager.listings[token_id].price_usd
+                    msg = build_listing_success_msg(token_id, tx_hash, price_usd, wallet["name"], chain_name)
                 else:
-                    msg = build_listing_failed_msg(
-                        token_id, reason, wallet["name"], chain_name
-                    )
-                    send_once("listing_failed", f"{token_id}_{chain_name}", msg)
+                    reason = detail.get("reason", "unknown")
+                    msg = build_listing_failed_msg(token_id, reason, wallet["name"], chain_name)
                 
-                # تأخير صغير بين الرسائل لتجنب السبام
-                await asyncio.sleep(0.5)
-        
-        # إرسال ملخص العملية
-        if results.get("total_owned", 0) > 0:
-            msg = build_listing_summary_msg(results, chain_name, wallet["name"])
-            send_once("listing", f"{wallet['address']}_{chain_name}_{nft_contract}", msg)
-            log.info(f"📋 عرض الرموز: {results['total_listed']} نجاح، {results['total_failed']} فشل")
+                send_telegram(msg)
+                await asyncio.sleep(0.3)
+            
+            if len(results.get("details", [])) > 5:
+                send_telegram(f"📋 ... و {len(results['details']) - 5} رموز أخرى")
+                
+        else:
+            log.info(f"ℹ️ لا توجد رموز لعرضها للمحفظة {wallet['name']}")
         
     except Exception as e:
-        log.error(f"❌ فشل عرض الرموز: {e}")
+        error_msg = f"❌ فشل عرض الرموز\n\nالمحفظة: {wallet['name']}\nالسلسلة: {chain_name}\nالسبب: {str(e)}"
+        log.error(error_msg)
         log.error(traceback.format_exc())
+        send_telegram(error_msg)
 
+# ===================================================================
+# دوال إعادة المحاولة الدورية للعرض
+# ===================================================================
 async def retry_failed_listings_loop():
-    """دورة دورية لإعادة محاولة عرض الرموز الفاشلة كل 30 دقيقة مع إشعارات."""
+    """دورة دورية لإعادة محاولة عرض الرموز الفاشلة كل 30 دقيقة."""
     while True:
         try:
             if listing_manager.has_pending_listings():
@@ -956,7 +934,6 @@ async def retry_failed_listings_loop():
                         if not marketplace_address:
                             continue
                         
-                        # جلب الرموز الفاشلة التي حان وقت إعادة محاولتها
                         with listing_manager.lock:
                             failed_candidates = []
                             now = time.time()
@@ -967,21 +944,11 @@ async def retry_failed_listings_loop():
                                             failed_candidates.append(data)
                         
                         if failed_candidates:
-                            log.info(f"🔄 إعادة محاولة {len(failed_candidates)} رمز فاشل للمحفظة {wallet['name']} على {chain_name}")
+                            log.info(f"🔄 إعادة محاولة {len(failed_candidates)} رمز فاشل")
                             
                             nft_contract = failed_candidates[0].nft_contract if failed_candidates else None
                             if not nft_contract:
                                 continue
-                            
-                            # إرسال إشعار بدء إعادة المحاولة
-                            start_msg = (
-                                f"🔄 <b>بدء إعادة محاولة عرض الرموز الفاشلة</b>\n\n"
-                                f"👛 المحفظة: {wallet['name']}\n"
-                                f"⛓️ السلسلة: {CHAINS_CONFIG[chain_name]['chain_name_display']}\n"
-                                f"🔢 عدد الرموز: {len(failed_candidates)}\n"
-                                f"⏱️ الفاصل: 30 دقيقة"
-                            )
-                            send_telegram(start_msg)
                             
                             results = await asyncio.to_thread(
                                 retry_failed_listings,
@@ -994,28 +961,6 @@ async def retry_failed_listings_loop():
                                 marketplace_address=marketplace_address,
                             )
                             
-                            # إرسال إشعارات تفصيلية
-                            if results.get("details"):
-                                for detail in results["details"]:
-                                    token_id = detail.get("token_id", "")
-                                    success = detail.get("success", False)
-                                    reason = detail.get("reason", "")
-                                    
-                                    if success:
-                                        data = listing_manager.listings.get(token_id)
-                                        price_usd = data.price_usd if data else 0
-                                        msg = build_listing_success_msg(
-                                            token_id, detail.get("tx_hash", ""), price_usd,
-                                            wallet["name"], chain_name
-                                        )
-                                        send_telegram(msg)
-                                    else:
-                                        msg = build_listing_failed_msg(
-                                            token_id, reason, wallet["name"], chain_name
-                                        )
-                                        send_telegram(msg)
-                            
-                            # إرسال ملخص إعادة المحاولة
                             if results.get("total_retried", 0) > 0:
                                 msg = build_listing_retry_msg(results, chain_name, wallet["name"])
                                 send_telegram(msg)
@@ -1028,7 +973,7 @@ async def retry_failed_listings_loop():
             await asyncio.sleep(60)
 
 async def relist_successful_tokens_loop():
-    """دورة دورية لإعادة عرض الرموز الناجحة كل 4 ساعات مع إشعارات."""
+    """دورة دورية لإعادة عرض الرموز الناجحة كل 4 ساعات."""
     while True:
         try:
             log.info("🔄 بدء دورة إعادة عرض الرموز الناجحة...")
@@ -1043,7 +988,6 @@ async def relist_successful_tokens_loop():
                     if not marketplace_address:
                         continue
                     
-                    # جلب الرموز الناجحة التي حان وقت إعادة عرضها
                     with listing_manager.lock:
                         relist_candidates = []
                         now = time.time()
@@ -1054,17 +998,7 @@ async def relist_successful_tokens_loop():
                                         relist_candidates.append(data)
                     
                     if relist_candidates:
-                        log.info(f"🔄 إعادة عرض {len(relist_candidates)} رمز ناجح للمحفظة {wallet['name']} على {chain_name}")
-                        
-                        # إرسال إشعار بدء إعادة العرض
-                        start_msg = (
-                            f"🔄 <b>بدء إعادة عرض الرموز الناجحة</b>\n\n"
-                            f"👛 المحفظة: {wallet['name']}\n"
-                            f"⛓️ السلسلة: {CHAINS_CONFIG[chain_name]['chain_name_display']}\n"
-                            f"🔢 عدد الرموز: {len(relist_candidates)}\n"
-                            f"⏱️ الفاصل: 4 ساعات"
-                        )
-                        send_telegram(start_msg)
+                        log.info(f"🔄 إعادة عرض {len(relist_candidates)} رمز ناجح")
                         
                         nft_contract = relist_candidates[0].nft_contract if relist_candidates else None
                         if not nft_contract:
@@ -1081,28 +1015,6 @@ async def relist_successful_tokens_loop():
                             marketplace_address=marketplace_address,
                         )
                         
-                        # إرسال إشعارات تفصيلية
-                        if results.get("details"):
-                            for detail in results["details"]:
-                                token_id = detail.get("token_id", "")
-                                success = detail.get("success", False)
-                                reason = detail.get("reason", "")
-                                
-                                if success:
-                                    data = listing_manager.listings.get(token_id)
-                                    price_usd = data.price_usd if data else 0
-                                    msg = build_listing_success_msg(
-                                        token_id, detail.get("tx_hash", ""), price_usd,
-                                        wallet["name"], chain_name
-                                    )
-                                    send_telegram(msg)
-                                else:
-                                    msg = build_listing_failed_msg(
-                                        token_id, reason, wallet["name"], chain_name
-                                    )
-                                    send_telegram(msg)
-                        
-                        # إرسال ملخص إعادة العرض
                         if results.get("total_relisted", 0) > 0:
                             msg = build_relist_msg(results, chain_name, wallet["name"])
                             send_telegram(msg)
@@ -1114,49 +1026,6 @@ async def relist_successful_tokens_loop():
             log.error(f"❌ خطأ في relist_successful_tokens_loop: {e}")
             log.error(traceback.format_exc())
             await asyncio.sleep(60)
-
-# ===================================================================
-# وظائف مفقودة من الكود السابق
-# ===================================================================
-def build_soldout_msg(name):
-    return f"⛔ نفذت الكمية\n\nالمجموعة: {name}\n\nلم تعد هناك قطع متبقية للسك"
-
-def build_retry_start_msg(wallet_name, detail, reason):
-    name = detail.get("collection_name", "?")
-    return (
-        f"🔄 بدء إعادة المحاولة\n\n"
-        f"المحفظة: {wallet_name}\n"
-        f"المجموعة: {name}\n"
-        f"سبب الفشل: {get_reason_text(reason)}\n"
-        f"مدة الانتظار بين المحاولات: 3 ثواني\n\n"
-        f"ستستمر المحاولات حتى النجاح أو نفاذ الكمية"
-    )
-
-def build_retry_progress_msg(wallet_name, name, attempt):
-    return (
-        f"📊 تحديث حالة إعادة المحاولة\n\n"
-        f"المحفظة: {wallet_name}\n"
-        f"المجموعة: {name}\n"
-        f"عدد المحاولات: {attempt}\n\n"
-        f"ما زالت المحاولات مستمرة..."
-    )
-
-def build_retry_success_msg(wallet_name, name, attempt, tx_hash, ex):
-    return (
-        f"✅ نجحت إعادة المحاولة!\n\n"
-        f"المحفظة: {wallet_name}\n"
-        f"المجموعة: {name}\n"
-        f"نجحت بعد {attempt} محاولة\n"
-        f"رابط المعاملة: {ex}{tx_hash}"
-    )
-
-def build_permanent_msg(wallet_name, reason_text):
-    return (
-        f"⛔ توقفت إعادة المحاولة - سبب دائم\n\n"
-        f"المحفظة: {wallet_name}\n"
-        f"السبب: {reason_text}\n\n"
-        f"لا يمكن متابعة المحاولات لهذا السبب"
-    )
 
 # ===================================================================
 # دوال OpenSea Stream
@@ -1347,8 +1216,7 @@ async def run():
         f"💰 الحد الأقصى للسعر: ${MAX_LISTING_PRICE_USD:.6f}\n"
         f"🔄 إعادة محاولة الفاشلة: كل 30 دقيقة\n"
         f"🔄 إعادة عرض الناجحة: كل 4 ساعات\n"
-        f"📦 الحد الأقصى للعرض: {MAX_TOKENS_PER_LISTING_BATCH} رمز لكل عملية\n"
-        f"🔔 إشعارات العرض: مفعلة\n\n"
+        f"📦 الحد الأقصى للعرض: {MAX_TOKENS_PER_LISTING_BATCH} رمز لكل عملية\n\n"
         f"✅ النظام جاهز للعمل"
     )
     send_telegram(startup_msg)
