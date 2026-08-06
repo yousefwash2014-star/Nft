@@ -58,7 +58,7 @@ log = logging.getLogger("main")
 # ===================================================================
 # 🔔 تشغيل/إيقاف الإشعارات
 # ===================================================================
-ENABLE_NOTIFICATIONS = True  # 🔥 True = تشغيل، False = إيقاف
+ENABLE_NOTIFICATIONS = True
 
 # ===================================================================
 # المتغيرات العامة
@@ -77,21 +77,18 @@ sent = 0
 failed = 0
 
 def send_telegram(text: str):
-    """إرسال رسالة إلى تيليجرام."""
     if not ENABLE_NOTIFICATIONS:
         return
     if not text or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
         send_queue.put_nowait(text)
-        log.debug(f"📤 تم إضافة رسالة للطابور: {text[:50]}...")
     except Exception as e:
         log.error(f"❌ فشل إضافة رسالة للطابور: {e}")
 
 SENT: Dict[str, Set[str]] = {}
 
 def send_once(cat: str, key: str, text: str):
-    """إرسال رسالة مرة واحدة فقط (لمنع التكرار)."""
     if not ENABLE_NOTIFICATIONS:
         return
     if not text or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -102,7 +99,6 @@ def send_once(cat: str, key: str, text: str):
         SENT[cat].add(key)
         try:
             send_queue.put_nowait(text)
-            log.debug(f"📤 تم إضافة رسالة {cat} للطابور")
         except Exception as e:
             log.error(f"❌ فشل إضافة رسالة للطابور: {e}")
 
@@ -126,15 +122,12 @@ async def telegram_worker(wid: int):
                         ) as r:
                             if r.status == 200:
                                 sent += 1
-                                log.debug(f"✅ تم إرسال رسالة تيليجرام ({sent})")
                             elif r.status == 429:
                                 await asyncio.sleep(2)
                                 send_queue.put_nowait(text)
                             else:
                                 failed += 1
-                                log.warning(f"⚠️ فشل إرسال تيليجرام: HTTP {r.status}")
                     except asyncio.TimeoutError:
-                        log.warning(f"⚠️ Timeout في إرسال تيليجرام")
                         failed += 1
                     except Exception as e:
                         log.error(f"❌ خطأ في إرسال تيليجرام: {e}")
@@ -148,7 +141,6 @@ async def telegram_worker(wid: int):
                 await asyncio.sleep(1)
 
 async def telegram_sender():
-    """مرسل تيليجرام - يشغل 5 عمال."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("⚠️ متغيرات تيليجرام غير مكتملة")
         while True:
@@ -542,9 +534,6 @@ def build_permanent_msg(wallet_name, reason_text):
         f"لا يمكن متابعة المحاولات لهذا السبب"
     )
 
-# ===================================================================
-# رسائل عرض الرموز
-# ===================================================================
 def build_listing_summary_msg(results, chain_name, wallet_name):
     cd = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
     total = results.get("total_owned", 0)
@@ -701,10 +690,7 @@ async def process_wallet(session, slug, detail, stage, cn, wallet, ep, end_time=
             await update_balance(session, wa, cn)
             send_telegram(build_success_msg(detail, result, cn))
             
-            # =============================================================
-            # 🔥 عرض الرموز المملوكة في السوق بعد الشراء الناجح
-            # =============================================================
-            log.info(f"📋 بدء عرض الرموز للمحفظة {wn} على {cn}")
+            # عرض الرموز المملوكة في السوق بعد الشراء الناجح
             await list_owned_tokens(session, wallet, contract, cn)
             
         else:
@@ -834,13 +820,10 @@ async def retry_loop(session, tracker):
             return
 
 # ===================================================================
-# 🚀 دوال عرض الرموز في السوق (المعدلة والمحسنة)
+# دوال عرض الرموز في السوق
 # ===================================================================
 async def list_owned_tokens(session, wallet, nft_contract, chain_name):
-    """
-    عرض جميع الرموز المملوكة للمحفظة في السوق.
-    هذه الدالة تستدعى بعد كل عملية شراء ناجحة.
-    """
+    """عرض جميع الرموز المملوكة للمحفظة في السوق."""
     log.info(f"📋 [list_owned_tokens] بدء عرض الرموز للمحفظة {wallet['name']} على {chain_name}")
     
     w3 = w3_instances.get(chain_name)
@@ -857,9 +840,6 @@ async def list_owned_tokens(session, wallet, nft_contract, chain_name):
     eth_price_usd = await get_eth_price(session)
     
     try:
-        # تنفيذ العرض
-        log.info(f"📋 استدعاء list_all_owned_tokens للمحفظة {wallet['name']}")
-        
         results = await asyncio.to_thread(
             list_all_owned_tokens,
             w3=w3,
@@ -876,15 +856,12 @@ async def list_owned_tokens(session, wallet, nft_contract, chain_name):
         
         log.info(f"📋 نتائج العرض: {results}")
         
-        # إرسال النتائج
         if results.get("total_owned", 0) > 0:
             log.info(f"✅ تم عرض {results['total_listed']} رمز من {results['total_owned']}")
             
-            # إرسال ملخص
             summary_msg = build_listing_summary_msg(results, chain_name, wallet["name"])
             send_telegram(summary_msg)
             
-            # إرسال تفاصيل لكل رمز (حد 5 تفاصيل لتجنب السبام)
             for idx, detail in enumerate(results.get("details", [])[:5]):
                 token_id = detail.get("token_id", "")
                 success = detail.get("success", False)
@@ -918,7 +895,6 @@ async def list_owned_tokens(session, wallet, nft_contract, chain_name):
 # دوال إعادة المحاولة الدورية للعرض
 # ===================================================================
 async def retry_failed_listings_loop():
-    """دورة دورية لإعادة محاولة عرض الرموز الفاشلة كل 30 دقيقة."""
     while True:
         try:
             if listing_manager.has_pending_listings():
@@ -973,7 +949,6 @@ async def retry_failed_listings_loop():
             await asyncio.sleep(60)
 
 async def relist_successful_tokens_loop():
-    """دورة دورية لإعادة عرض الرموز الناجحة كل 4 ساعات."""
     while True:
         try:
             log.info("🔄 بدء دورة إعادة عرض الرموز الناجحة...")
@@ -1031,23 +1006,37 @@ async def relist_successful_tokens_loop():
 # دوال OpenSea Stream
 # ===================================================================
 async def recheck_slugs(session):
+    """إعادة فحص slugs المعروفة."""
     while True:
         try:
-            for slug in list(NOTIFIED)[:100]:
+            # نسخ قائمة slugs لتجنب التعديل أثناء التكرار
+            slugs_to_check = list(NOTIFIED)[:50]
+            
+            for slug in slugs_to_check:
                 if slug in CHECKING:
                     continue
-                found, detail = await fetch_drop(session, slug)
-                if found:
-                    stages = find_all_free_stages(detail)
-                    if stages.get("active"):
-                        log.info(f"إعادة فحص: {slug}")
-                        async with CHECKING_LOCK:
-                            CHECKING.add(slug)
-                        asyncio.create_task(handle_mint(session, slug, "ethereum"))
-                        await asyncio.sleep(1)
-        except:
-            pass
-        await asyncio.sleep(10)
+                
+                try:
+                    found, detail = await fetch_drop(session, slug)
+                    if found:
+                        stages = find_all_free_stages(detail)
+                        if stages.get("active"):
+                            log.info(f"إعادة فحص: {slug}")
+                            async with CHECKING_LOCK:
+                                CHECKING.add(slug)
+                            asyncio.create_task(handle_mint(session, slug, "ethereum"))
+                            await asyncio.sleep(0.5)  # تأخير صغير
+                except Exception as e:
+                    log.warning(f"⚠️ خطأ في إعادة فحص {slug}: {e}")
+                    continue
+            
+            # انتظار قبل الدورة التالية
+            await asyncio.sleep(30)
+            
+        except Exception as e:
+            log.error(f"❌ خطأ في recheck_slugs: {e}")
+            log.error(traceback.format_exc())
+            await asyncio.sleep(30)
 
 async def handle_mint(session, slug, cn):
     global NOTIFIED, CHECKING
