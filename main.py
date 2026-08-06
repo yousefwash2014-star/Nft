@@ -1,1440 +1,1469 @@
 """
-النظام الكامل: اكتشاف مينت مجاني بدأ اليوم على Ethereum + Robinhood Chain،
-التحقق من كل الضوابط عبر buyer.py، تنفيذ الشراء، وإرسال إشعار تيليجرام.
-
-تم التطوير:
-  - ⚡ معالجة متوازية (asyncio.Semaphore) للتعامل مع عدة مجموعات في نفس الوقت
-  - ⛓️ دعم سلاسل متعددة (Ethereum + Robinhood) مع معالجة متوازية
-  - 👛 دعم 5 محافظ مع معالجة متوازية (كل محافظة على كل سلسلة)
-  - 🚀 استخدام aiohttp لطلبات API أسرع من requests التقليدية
-  - 💰 تحديث سعر ETH كل 60 ثانية بدلاً من 300 (تحديث أسرع)
-  - 🔄 نظام إعادة محاولة ذكي: يعيد المحاولة كل ساعة لمدة 8 ساعات عند الفشل
-  - 📊 تقارير محسّنة: توضح نوع المينت (مدفوع/مجاني) وحالة الأهلية
-
-هذا الملف هو المسؤول عن:
-- الاتصال بـ OpenSea Stream عبر WebSocket لرصد المينتات الجديدة
-- جلب تفاصيل الدروب من OpenSea API
-- التحقق من أن المينت مجاني وبدأ اليوم
-- استدعاء buyer.py لتنفيذ عمليات الشراء من جميع المحافظ
-- إرسال إشعارات تيليجرام بنتائج العمليات
-- إعادة المحاولة تلقائيًا عند الفشل (كل ساعة لمدة 8 ساعات)
+النظام المتكامل المحسن: اكتشاف وشراء NFT من المراحل المجانية فقط
+مع مراقبة الرصيد لكل سلسلة على حدة
+وعدم إيقاف الشراء كلياً عند انخفاض الرصيد في سلسلة واحدة
+على Ethereum + Robinhood Chain
+🔥 الشراء من جميع المحافظ بشكل متوازي
+✅ جميع الإشعارات تظهر بشكل فوري
 """
 
-# استيراد المكتبات الأساسية
-import asyncio          # للبرمجة غير المتزامنة (async/await)
-import json             # لتحليل بيانات JSON من API و WebSocket
-import logging          # لتسجيل الأحداث والأخطاء
-log = logging.getLogger(__name__)
-import os               # للوصول إلى متغيرات البيئة
-import time             # للتعامل مع الوقت والتخزين المؤقت
-from datetime import datetime, timezone, timedelta  # للتعامل مع التواريخ والمناطق الزمنية
-from dataclasses import dataclass, field  # لإنشاء كلاس بسيط لتتبع المحاولات
+import asyncio
+import json
+import logging
+import os
+import time
+import traceback
+from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass, field
+from typing import Optional, Set, Dict, List, Tuple
 
-# مكتبات خارجية للاتصالات غير المتزامنة
-import aiohttp          # مكتبة HTTP غير متزامنة (أسرع من requests)
-import websockets       # للاتصال بـ WebSocket الخاص بـ OpenSea
-from dotenv import load_dotenv  # لتحميل متغيرات البيئة من ملف .env
+import aiohttp
+import websockets
+from dotenv import load_dotenv
 
-# استيراد الدوال والإعدادات من buyer.py
 from buyer import (
-    get_web3_from_config,        # إنشاء اتصال Web3
-    attempt_purchase,            # تنفيذ عملية الشراء
-    CHAINS_CONFIG,               # إعدادات السلاسل المدعومة
-    quick_checks,                # الفحوصات السريعة (الرصيد، الغاز، الرسوم)
-    check_eligibility_reason,    # تحليل سبب الفشل وتحديد الأهلية
-    is_paid_mint,                # التحقق من نوع المينت (مدفوع/مجاني)
-    RETRYABLE_REASONS,           # أسباب الفشل القابلة لإعادة المحاولة
-    MIN_BALANCE_RESERVE_USD,     # الحد الأدنى للرصيد - للرسائل
-    MAX_GAS_FEE_USD,             # الحد الأقصى لرسوم الغاز - للرسائل
+    get_web3_from_config,
+    attempt_purchase,
+    CHAINS_CONFIG,
+    quick_checks,
+    is_price_free,
+    find_all_free_stages,
+    get_all_stages_info,
+    RETRYABLE_REASONS,
+    get_retry_config,
+    calculate_retry_delay,
+    get_reason_text,
+    MintResult,
+    MIN_BALANCE_RESERVE_USD,
+    MAX_GAS_FEE_USD,
+    FREE_PRICE_THRESHOLD_WEI,
+    RetryConfig,
+    get_wallet_balance,
 )
 
-# تحميل متغيرات البيئة من ملف .env (إن وجد)
+# تحميل متغيرات البيئة
 load_dotenv()
 
-# ===================================================================
-# المتغيرات العامة (تقرأ من متغيرات البيئة)
-# ===================================================================
-# كل هذه القيم يجب تعبئتها في ملف .env قبل تشغيل النظام
+# ===========================================================================
+# التهيئة
+# ===========================================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger("main")
 
-# مفاتيح API الأساسية
-OPENSEA_API_KEY = os.environ["OPENSEA_API_KEY"].strip()           # مفتاح OpenSea API
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()     # توكن بوت تيليجرام
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()         # معرف الدردشة في تيليجرام
-BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").strip().lower() == "true"  # تفعيل/إيقاف البوت
+# ===========================================================================
+# ✅ التحقق من ملف .env والمتغيرات
+# ===========================================================================
 
-# ===================================================================
-# إعداد المحافظ المتعددة (حتى 5 محافظ)
-# ===================================================================
-# النظام يدعم 5 محافظ كحد أقصى. يتم قراءة المحافظ من متغيرات البيئة.
-# المحفظة الأولى تستخدم: PRIVATE_KEY + WALLET_ADDRESS
-# المحافظ الإضافية تستخدم: WALLET_2_PRIVATE_KEY + WALLET_2_ADDRESS
-#                     و: WALLET_3_PRIVATE_KEY + WALLET_3_ADDRESS ... إلخ
-#
-# مثال لملف .env (3 محافظ):
-#   PRIVATE_KEY=0xabc...           # المحفظة 1
-#   WALLET_ADDRESS=0x123...
-#   WALLET_2_PRIVATE_KEY=0xdef...  # المحفظة 2
-#   WALLET_2_ADDRESS=0x456...
-#   WALLET_3_PRIVATE_KEY=0x789...  # المحفظة 3
-#   WALLET_3_ADDRESS=0xabc...
+def verify_env_file():
+    """التحقق من وجود ملف .env وقراءته"""
+    env_path = ".env"
+    if os.path.exists(env_path):
+        log.info(f"✅ ملف {env_path} موجود")
+        
+        # قراءة الملف وعرض محتواه (بدون المفاتيح)
+        with open(env_path, 'r') as f:
+            lines = f.readlines()
+            log.info(f"📄 {env_path} يحتوي على {len(lines)} سطر")
+            
+            # التحقق من وجود المتغيرات المهمة
+            important_vars = [
+                "ETHEREUM_RPC_URL",
+                "ROBINHOOD_RPC_URL", 
+                "PRIVATE_KEY",
+                "WALLET_ADDRESS",
+                "BOT_ENABLED"
+            ]
+            
+            found = []
+            for var in important_vars:
+                for line in lines:
+                    if line.startswith(f"{var}=") and not line.startswith("#"):
+                        found.append(var)
+                        break
+            
+            log.info(f"📋 المتغيرات الموجودة: {', '.join(found)}")
+            
+            # تحذير إذا كان BOT_ENABLED غير true
+            bot_enabled = os.environ.get("BOT_ENABLED", "").strip().lower()
+            if bot_enabled != "true":
+                log.warning(f"⚠️ BOT_ENABLED = {bot_enabled} (يجب أن يكون 'true')")
+    else:
+        log.error(f"❌ ملف {env_path} غير موجود!")
+        log.error("   💡 أنشئ ملف .env وأضف المتغيرات المطلوبة")
 
+def print_env_status():
+    """طباعة حالة متغيرات البيئة"""
+    log.info("=" * 60)
+    log.info("📋 حالة متغيرات البيئة:")
+    
+    # RPC URLs
+    eth_url = os.environ.get("ETHEREUM_RPC_URL", "").strip()
+    rob_url = os.environ.get("ROBINHOOD_RPC_URL", "").strip()
+    
+    if eth_url:
+        # إخفاء المفتاح للخصوصية
+        hidden = eth_url[:30] + "..." + eth_url[-10:] if len(eth_url) > 40 else eth_url
+        log.info(f"  ✅ ETHEREUM_RPC_URL: {hidden}")
+    else:
+        log.warning("  ❌ ETHEREUM_RPC_URL غير موجود")
+    
+    if rob_url:
+        hidden = rob_url[:30] + "..." + rob_url[-10:] if len(rob_url) > 40 else rob_url
+        log.info(f"  ✅ ROBINHOOD_RPC_URL: {hidden}")
+    else:
+        log.warning("  ❌ ROBINHOOD_RPC_URL غير موجود")
+    
+    # التحقق من المفاتيح العامة
+    PUBLIC_KEYS = ["alch_A1gYoxdzx_Zxz3SBG92Ox", "alch_ug5SYIto3LNu76VG3fZBk"]
+    
+    for key in PUBLIC_KEYS:
+        if key in eth_url:
+            log.warning(f"  ⚠️ ETHEREUM_RPC_URL يحتوي على مفتاح عام! يرجى استخدام مفتاحك الخاص")
+        if key in rob_url:
+            log.warning(f"  ⚠️ ROBINHOOD_RPC_URL يحتوي على مفتاح عام! يرجى استخدام مفتاحك الخاص")
+    
+    # المحافظ
+    wallet_count = 0
+    for i in range(1, 6):
+        if i == 1:
+            pk = os.environ.get("PRIVATE_KEY", "").strip()
+            addr = os.environ.get("WALLET_ADDRESS", "").strip()
+        else:
+            pk = os.environ.get(f"WALLET_{i}_PRIVATE_KEY", "").strip()
+            addr = os.environ.get(f"WALLET_{i}_ADDRESS", "").strip()
+        
+        if pk and addr:
+            wallet_count += 1
+            log.info(f"  ✅ المحفظة {i}: {addr[:10]}...")
+    
+    if wallet_count == 0:
+        log.warning("  ❌ لا توجد محافظ!")
+    else:
+        log.info(f"  ✅ إجمالي المحافظ: {wallet_count}")
+    
+    # Telegram
+    if os.environ.get("TELEGRAM_BOT_TOKEN", "").strip():
+        log.info("  ✅ TELEGRAM_BOT_TOKEN موجود")
+    else:
+        log.warning("  ❌ TELEGRAM_BOT_TOKEN غير موجود")
+    
+    if os.environ.get("TELEGRAM_CHAT_ID", "").strip():
+        log.info("  ✅ TELEGRAM_CHAT_ID موجود")
+    else:
+        log.warning("  ❌ TELEGRAM_CHAT_ID غير موجود")
+    
+    log.info("=" * 60)
+
+# ===========================================================================
+# متغيرات البيئة
+# ===========================================================================
+OPENSEA_API_KEY = os.environ.get("OPENSEA_API_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").strip().lower() == "true"
+
+# ===========================================================================
+# ✅ نظام تيليجرام المحسن - مع تأكيد الإرسال
+# ===========================================================================
+TELEGRAM_SENDERS = 3
+send_queue: asyncio.Queue = asyncio.Queue()
+telegram_semaphore = asyncio.Semaphore(TELEGRAM_SENDERS)
+# تتبع الرسائل المرسلة للتأكد من عدم فقدانها
+sent_count = 0
+failed_count = 0
+
+def send_telegram(text: str):
+    """إرسال رسالة تيليجرام - مع تسجيل فوري"""
+    if not text:
+        log.warning("⚠️ محاولة إرسال رسالة فارغة")
+        return
+    
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning(f"⚠️ تيليجرام غير مهيأ - الرسالة: {text[:100]}...")
+        return
+    
+    try:
+        send_queue.put_nowait(text)
+        log.info(f"📤 تمت إضافة رسالة إلى قائمة الإرسال: {text[:80]}...")
+    except asyncio.QueueFull:
+        log.error("❌ قائمة إرسال تيليجرام ممتلئة!")
+    except Exception as e:
+        log.error(f"❌ خطأ في إضافة رسالة: {e}")
+
+async def telegram_worker(worker_id: int):
+    """عامل إرسال تيليجرام مع معالجة أفضل للأخطاء"""
+    global sent_count, failed_count
+    
+    async with aiohttp.ClientSession() as session:
+        while True:
+            try:
+                text = await send_queue.get()
+                
+                async with telegram_semaphore:
+                    try:
+                        log.info(f"📤 [عامل {worker_id}] جاري إرسال: {text[:80]}...")
+                        
+                        async with session.post(
+                            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                            data={
+                                "chat_id": TELEGRAM_CHAT_ID,
+                                "text": text,
+                                "parse_mode": "HTML",
+                                "disable_web_page_preview": False,
+                            },
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as resp:
+                            if resp.status == 200:
+                                sent_count += 1
+                                log.info(f"✅ [عامل {worker_id}] تم الإرسال بنجاح (#{sent_count})")
+                            elif resp.status == 429:
+                                log.warning(f"⚠️ [عامل {worker_id}] طلب كثير جداً - انتظار 3 ثواني")
+                                await asyncio.sleep(3)
+                                # إعادة المحاولة
+                                send_queue.put_nowait(text)
+                            else:
+                                failed_count += 1
+                                error_text = await resp.text()
+                                log.error(f"❌ [عامل {worker_id}] HTTP {resp.status}: {error_text[:200]}")
+                    except asyncio.TimeoutError:
+                        failed_count += 1
+                        log.error(f"⏰ [عامل {worker_id}] انتهت مهلة الإرسال")
+                    except Exception as e:
+                        failed_count += 1
+                        log.error(f"❌ [عامل {worker_id}] خطأ: {e}")
+                    finally:
+                        send_queue.task_done()
+                        
+            except asyncio.CancelledError:
+                log.info(f"👋 [عامل {worker_id}] تم إلغاء العامل")
+                break
+            except Exception as e:
+                log.error(f"💥 [عامل {worker_id}] خطأ غير متوقع: {e}")
+                await asyncio.sleep(1)
+
+async def telegram_sender():
+    """بدء عمال الإرسال"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("⚠️ تيليجرام غير مهيأ - لن يتم إرسال رسائل")
+        # إنشاء عامل وهمي لمنع تعليق النظام
+        while True:
+            try:
+                text = await send_queue.get()
+                log.info(f"📝 [محاكاة] رسالة: {text[:100]}...")
+                send_queue.task_done()
+            except:
+                await asyncio.sleep(1)
+        return
+    
+    workers = [telegram_worker(i) for i in range(TELEGRAM_SENDERS)]
+    await asyncio.gather(*workers)
+
+# اختبار تيليجرام عند البدء
+def test_telegram():
+    """اختبار اتصال تيليجرام"""
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        log.info("📡 اختبار اتصال تيليجرام...")
+        send_telegram("✅ <b>اختبار اتصال تيليجرام</b>\n\nالنظام يعمل بشكل صحيح")
+    else:
+        log.warning("⚠️ تيليجرام غير مهيأ - تأكد من TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID")
+
+# ===========================================================================
+# تحميل المحافظ
+# ===========================================================================
 def load_wallets():
-    """
-    قراءة جميع المحافظ المدعومة (حتى 5) من متغيرات البيئة.
-    
-    المحفظة 1 إجبارية (PRIVATE_KEY + WALLET_ADDRESS)
-    المحفظة 2-5 اختيارية (WALLET_2_PRIVATE_KEY + WALLET_2_ADDRESS ...)
-    
-    لكل محفظة نحتاج:
-    - name: اسم المحفظة (للعرض في الإشعارات)
-    - private_key: المفتاح الخاص (يبدأ بـ 0x)
-    - address: العنوان العام (يبدأ بـ 0x)
-    
-    المخرجات:
-        list[dict] - قائمة المحافظ النشطة
-    """
+    """تحميل المحافظ من .env"""
     wallets = []
     
-    # قائمة بأزواج متغيرات البيئة لكل محفظة
     wallet_configs = [
-        ("ايهاب 1", "PRIVATE_KEY", "WALLET_ADDRESS"),
-        ("حاتم 2", "WALLET_2_PRIVATE_KEY", "WALLET_2_ADDRESS"),
+        ("المحفظة 1", "PRIVATE_KEY", "WALLET_ADDRESS"),
+        ("المحفظة 2", "WALLET_2_PRIVATE_KEY", "WALLET_2_ADDRESS"),
         ("المحفظة 3", "WALLET_3_PRIVATE_KEY", "WALLET_3_ADDRESS"),
         ("المحفظة 4", "WALLET_4_PRIVATE_KEY", "WALLET_4_ADDRESS"),
         ("المحفظة 5", "WALLET_5_PRIVATE_KEY", "WALLET_5_ADDRESS"),
     ]
     
     for name, pk_var, addr_var in wallet_configs:
-        private_key = os.environ.get(pk_var)
-        address = os.environ.get(addr_var)
+        private_key = os.environ.get(pk_var, "").strip()
+        address = os.environ.get(addr_var, "").strip()
+        
         if private_key and address:
-            wallets.append({
-                "name": name,
-                "private_key": private_key,
-                "address": address,
-            })
-            log.info(f"✅ {name}: {address[:10]}... تم التحميل")
+            # التحقق من صحة العنوان
+            if address.startswith("0x") and len(address) == 42:
+                wallets.append({
+                    "name": name,
+                    "private_key": private_key,
+                    "address": address,
+                })
+                log.info(f"✅ {name}: {address[:10]}...{address[-6:]}")
+            else:
+                log.warning(f"⚠️ {name}: عنوان غير صحيح: {address}")
+        else:
+            log.info(f"⏭️ {name}: غير مهيأ")
     
     return wallets
 
-# تحميل جميع المحافظ
 WALLETS = load_wallets()
-if not WALLETS:
-    logging.warning("⚠️ لم يتم العثور على أي محفظة! تأكد من تعبئة PRIVATE_KEY و WALLET_ADDRESS في ملف .env")
-else:
-    logging.info(f"👛 تم تحميل {len(WALLETS)} محفظة")
 
-# روابط RPC للسلاسل المختلفة (اختياري - يمكن ترك أحدها فارغًا)
-# .strip() مهمة لإزالة أي \n أو مسافات في نهاية القيمة (تسبب %0A وخطأ 401 مع Alchemy)
-ROBINHOOD_RPC_URL = os.environ.get("ROBINHOOD_RPC_URL", "").strip()   # RPC لـ Robinhood Chain
-ETHEREUM_RPC_URL = os.environ.get("ETHEREUM_RPC_URL", "").strip()     # RPC لـ Ethereum
+# ===========================================================================
+# إعدادات السلاسل - استخدام المفاتيح من .env
+# ===========================================================================
 
-# تفعيل السلاسل المتاحة
-# نتحقق من وجود RPC URL لكل سلسلة ونضيفها إلى القائمة النشطة
+# قراءة URLs من .env
+ROBINHOOD_RPC_URL = os.environ.get("ROBINHOOD_RPC_URL", "").strip()
+ETHEREUM_RPC_URL = os.environ.get("ETHEREUM_RPC_URL", "").strip()
+
+# التحقق من وجود URLs
+if not ETHEREUM_RPC_URL:
+    log.warning("⚠️ ETHEREUM_RPC_URL غير موجود في .env")
+if not ROBINHOOD_RPC_URL:
+    log.warning("⚠️ ROBINHOOD_RPC_URL غير موجود في .env")
+
 ENABLED_CHAINS = []
 if ROBINHOOD_RPC_URL:
-    CHAINS_CONFIG["robinhood"]["rpc_url"] = ROBINHOOD_RPC_URL  # نضبط الـ RPC
-    ENABLED_CHAINS.append("robinhood")                          # نضيف السلسلة
+    CHAINS_CONFIG["robinhood"]["rpc_url"] = ROBINHOOD_RPC_URL
+    ENABLED_CHAINS.append("robinhood")
+    log.info(f"✅ Robinhood RPC: {ROBINHOOD_RPC_URL[:40]}...")
+    
 if ETHEREUM_RPC_URL:
-    CHAINS_CONFIG["ethereum"]["rpc_url"] = ETHEREUM_RPC_URL    # نضبط الـ RPC
-    ENABLED_CHAINS.append("ethereum")                           # نضيف السلسلة
+    CHAINS_CONFIG["ethereum"]["rpc_url"] = ETHEREUM_RPC_URL
+    ENABLED_CHAINS.append("ethereum")
+    log.info(f"✅ Ethereum RPC: {ETHEREUM_RPC_URL[:40]}...")
 
-# ===================================================================
-# ثوابت الاتصال بالخدمات الخارجية
-# ===================================================================
-# هذه العناوين ثابتة ولا تتغير
-
-STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"  # رابط WebSocket
-TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"  # رابط API تيليجرام
-DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"              # رابط API الدروب
-
-# عنوان الصفر (0x0...) - نستخدمه للتحقق من أن الناقل هو العقد (مينت جديد)
-ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
-
-# ===================================================================
-# روابط مستكشفات البلوكشين لكل سلسلة
-# ===================================================================
-# تستخدم لإنشاء رابط المعاملة (tx) على المستكشف
-# حتى يتمكن المستخدم من فتح الرابط ومعرفة سبب الفشل بنفسه
-
-EXPLORER_URLS = {
-    "ethereum": "https://etherscan.io/tx/",
-    "robinhood": "https://explorer.robinhood.org/tx/",
-}
-
-# تعريف المنطقة الزمنية المحلية (UTC+3)
-LOCAL_TZ = timezone(timedelta(hours=3))
-
-# ===================================================================
-# إعدادات الأداء والأمان
-# ===================================================================
-# هذه القيم تتحكم بسرعة وأداء النظام
-
-MAX_CONCURRENT_MINTS = 5        # حد أقصى 3 مجموعات تتم معالجتها في نفس الوقت
-HEARTBEAT_INTERVAL = 20         # إرسال نبضات حياة كل 20 ثانية للحفاظ على اتصال WebSocket
-RECV_TIMEOUT = 5                # timeout لاستقبال الرسائل من WebSocket (ثوانٍ)
-FREE_PRICE_THRESHOLD_USD = 0.00000001 # أقل من هذا السعر بالدولار = "مجاني عمليًا"
-ETH_PRICE_CACHE_TTL = 45        # تحديث سعر ETH كل 60 ثانية (بدلاً من 300 في الإصدار القديم)
-SCAN_INTERVAL = 40              # الماسح الدوري: فحص المينتات النشطة كل 5 دقائق
-
-# ===================================================================
-# إعدادات نظام إعادة المحاولة (Retry System)
-# ===================================================================
-
-# --- إعدادات عامة ---
-MAX_RETRY_HOURS = 8               # المدة القصوى لإعادة المحاولة (8 ساعات)
-RETRY_INTERVAL = 1800             # الفاصل الزمني الافتراضي (3600 ثانية = ساعة واحدة)
-MAX_RETRIES_PER_TASK = MAX_RETRY_HOURS  # أقصى عدد محاولات افتراضي = 8
-
-# --- إعدادات إعادة المحاولة حسب نوع الفشل ---
-# 1. رسوم الغاز مرتفعة → كل دقيقة لمدة 7 محاولات كحد أقصى
-GAS_RETRY_INTERVAL = 60               # كل 60 ثانية = دقيقة واحدة
-GAS_RETRY_MAX_ATTEMPTS = 7            # أقصى 7 محاولات
-
-# 2. المينت مدفوع → كل 5 دقائق لحين يصبح مجاني (لمدة 8 ساعات)
-PAID_MINT_RETRY_INTERVAL = 300        # كل 300 ثانية = 5 دقائق
-
-# 3. غير مؤهل (الرصيد منخفض) → كل 30 دقيقة لمدة 8 ساعات
-ELIGIBILITY_RETRY_INTERVAL = 1800     # كل 1800 ثانية = 30 دقيقة
-
-# رسائل إعادة المحاولة
-RETRY_MESSAGES = {
-    "retry_starting": "🔄 <b>جاري إعادة المحاولة</b>\n\nالمجموعة: <b>{name}</b>\nالسلسلة: {chain}\nالمحفظة: {wallet}\nالمحاولة: {attempt}/{max_retries}\nالسبب السابق: {reason}\nالوقت المتبقي: {hours_remaining} ساعة",
-    "retry_expired": "⏰ <b>انتهت محاولات إعادة الشراء</b>\n\nالمجموعة: <b>{name}</b>\nالسلسلة: {chain}\nالمحفظة: {wallet}\nعدد المحاولات: {attempts}\nالمدة: {hours} ساعات\nتوقف النظام عن المحاولة لهذه العملية.",
-    "retry_success": "✅ <b>تم الشراء بنجاح بعد إعادة المحاولة!</b>\n\nالمجموعة: <b>{name}</b>\nالسلسلة: {chain}\nالمحفظة: {wallet}\nالمحاولة: {attempt}/{max_retries}\nالكمية: {quantity}\nرسوم الغاز: ${gas_fee:.4f}\nمعاملة: {tx_hash}",
-}
-
-
-# ===================================================================
-# كلاس تتبع المحاولات لكل (slug, wallet_address, chain_name)
-# ===================================================================
-# هذا الكلاس يتتبع لكل مهمة فاشلة:
-# - عدد المحاولات
-# - وقت بدء المحاولات
-# - بيانات الدروب (للرجوع إليها عند إعادة المحاولة)
-
-@dataclass
-class RetryTracker:
-    """تتبع محاولات إعادة الشراء لمهمة واحدة."""
-    slug: str                                  # معرف المجموعة
-    wallet_address: str                        # عنوان المحفظة
-    chain_name: str                            # اسم السلسلة
-    detail: dict                               # بيانات الدروب (لإعادة الاستخدام)
-    wallet_name: str                           # اسم المحفظة
-    wallet_private_key: str                    # المفتاح الخاص (لإعادة المحاولة)
-    price_wei: int                             # سعر التوكن
-    max_per_wallet: int | None                 # الحد الأقصى لكل محفظة
-    remaining_supply: int                       # الكمية المتبقية
-    eth_price_usd: float                        # سعر ETH وقت الفشل
-    start_time: float = field(default_factory=time.time)  # وقت بدء المحاولات
-    attempt_count: int = 1                     # عدد المحاولات (يبدأ بـ 1 لأن أول محاولة فشلت)
-    original_reason: str = ""                  # سبب الفشل الأصلي
-    
-    @property
-    def hours_passed(self) -> float:
-        """حساب عدد الساعات التي مضت منذ بدء المحاولات."""
-        return (time.time() - self.start_time) / 3600
-    
-    @property
-    def is_expired(self) -> bool:
-        """التحقق مما إذا كانت المدة قد انتهت (8 ساعات)."""
-        return self.hours_passed >= MAX_RETRY_HOURS
-    
-    @property
-    def hours_remaining(self) -> float:
-        """حساب الساعات المتبقية."""
-        remaining = MAX_RETRY_HOURS - self.hours_passed
-        return max(0, remaining)
-    
-    @property
-    def retry_key(self) -> str:
-        """مفتاح فريد للمهمة (slug + wallet + chain)."""
-        return f"{self.slug}:{self.wallet_address}:{self.chain_name}"
-
-
-# قاموس لتتبع جميع مهام إعادة المحاولة
-retry_tasks: dict[str, RetryTracker] = {}
-# قفل لحماية قاموس إعادة المحاولة من الوصول المتزامن
-retry_lock = asyncio.Lock()
-
-# ===================================================================
-# إعدادات تسجيل الأحداث (Logging)
-# ===================================================================
-# نضبط تنسيق الرسائل ليكون مقروءًا وسهل التتبع
-
-logging.basicConfig(
-    level=logging.INFO,                                 # مستوى التسجيل: INFO فما فوق
-    format="%(asctime)s | %(levelname)s | %(message)s", # تنسيق: وقت | مستوى | رسالة
-    datefmt="%H:%M:%S",                                 # تنسيق الوقت: ساعة:دقيقة:ثانية
-)
-logger = logging.getLogger("auto-buyer-v2")  # اسم المسجل
-
-# ===================================================================
-# إنشاء اتصالات Web3 لكل سلسلة نشطة
-# ===================================================================
-# نقوم بإنشاء كائن Web3 لكل سلسلة (Ethereum و/أو Robinhood)
-# حتى نتمكن من إرسال المعاملات عليها
-
+# إنشاء اتصالات Web3 مع تحقق أفضل
 w3_instances = {}
 for chain_name in ENABLED_CHAINS:
     try:
-        # إنشاء اتصال Web3 من إعدادات السلسلة
-        w3_instances[chain_name] = get_web3_from_config(CHAINS_CONFIG[chain_name])
-        logging.info(f"✅ {CHAINS_CONFIG[chain_name]['chain_name_display']} - Web3 متصل")
+        w3 = get_web3_from_config(CHAINS_CONFIG[chain_name])
+        
+        # اختبار الاتصال
+        if w3.is_connected():
+            block_number = w3.eth.block_number
+            chain_id = w3.eth.chain_id
+            w3_instances[chain_name] = w3
+            log.info(f"✅ {CHAINS_CONFIG[chain_name]['chain_name_display']} - متصل (الكتلة: {block_number}, Chain ID: {chain_id})")
+        else:
+            log.error(f"❌ {CHAINS_CONFIG[chain_name]['chain_name_display']} - غير متصل")
+            
     except Exception as e:
-        logging.error(f"❌ {CHAINS_CONFIG[chain_name]['chain_name_display']} - فشل الاتصال: {e}")
+        error_msg = str(e)
+        if "429" in error_msg:
+            log.error(f"❌ {CHAINS_CONFIG[chain_name]['chain_name_display']} - تجاوز حد الطلبات (429)")
+            log.error(f"   💡 تأكد من استخدام مفاتيح Alchemy الخاصة بك")
+        elif "401" in error_msg or "unauthorized" in error_msg.lower():
+            log.error(f"❌ {CHAINS_CONFIG[chain_name]['chain_name_display']} - مفتاح غير صحيح (401)")
+            log.error(f"   💡 تأكد من صحة المفتاح في ملف .env")
+        else:
+            log.error(f"❌ {CHAINS_CONFIG[chain_name]['chain_name_display']} - فشل: {e}")
 
-# كائن Semaphore للتحكم في التزامن (يمنع تنفيذ أكثر من MAX_CONCURRENT_MINTS عملية في وقت واحد)
-semaphore = asyncio.Semaphore(MAX_CONCURRENT_MINTS)
+# ===========================================================================
+# الثوابت
+# ===========================================================================
+STREAM_URL = f"wss://stream.openseabeta.com/socket/websocket?token={OPENSEA_API_KEY}&vsn=2.0.0"
+DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
+LOCAL_TZ = timezone(timedelta(hours=3))
 
-# ===================================================================
-# ذاكرة تخزين مؤقت لسعر ETH
-# ===================================================================
-# نخزن السعر ووقت التخزين لتجنب استدعاء API بشكل متكرر
+MAX_CONCURRENT = 3
+MAX_CONCURRENT_MINTS = 10
+HEARTBEAT_INTERVAL = 20
 
-_eth_price_cache = {"value": None, "ts": 0}  # القيمة ووقت التخزين (timestamp)
+SCAN_INTERVAL = 20
+BALANCE_CHECK_INTERVAL = 300  # زيادة إلى 5 دقائق لتجنب 429
+ETH_PRICE_CACHE_TTL = 60
+DROPS_LIMIT = 50
+MIN_SCAN_INTERVAL = 15
+EVENT_CACHE_TTL = 5
 
+# ===========================================================================
+# Global State
+# ===========================================================================
+NOTIFIED: Set[str] = set()
+CHECKING: Set[str] = set()
+CHECKING_LOCK = asyncio.Lock()
+LAST_SCAN: Dict[str, float] = {}
 
-async def get_eth_price_usd(session: aiohttp.ClientSession) -> float:
-    """
-    جلب سعر ETH من CoinGecko مع تخزين مؤقت.
-    
-    هذه الدالة:
-    1. تتحقق أولاً من وجود قيمة مخزنة حديثة (أقل من ETH_PRICE_CACHE_TTL ثانية)
-    2. إذا كانت موجودة، تعيدها فورًا (بدون طلب API)
-    3. إذا لم تكن موجودة أو منتهية الصلاحية، تجلب السعر من CoinGecko
-    
-    المعاملات:
-        session: aiohttp.ClientSession - جلسة HTTP نشطة
-    
-    المخرجات:
-        float - سعر ETH الحالي بالدولار
-    """
+# حالة الرصيد لكل محفظة × سلسلة
+WALLET_BALANCES: Dict[str, Dict[str, Dict]] = {}
+BALANCE_LOCK = asyncio.Lock()
+
+# المحافظ منخفضة الرصيد لكل سلسلة
+LOW_BALANCE_BY_CHAIN: Dict[str, Set[str]] = {}
+LOW_BALANCE_NOTIFIED: Set[str] = set()
+
+# ===========================================================================
+# تخزين سعر ETH
+# ===========================================================================
+_eth_price_cache = {"value": None, "ts": 0}
+
+async def get_eth_price(session: aiohttp.ClientSession) -> float:
     now = time.time()
-    
-    # التحقق من وجود قيمة مخزنة حديثة
     if _eth_price_cache["value"] and (now - _eth_price_cache["ts"] < ETH_PRICE_CACHE_TTL):
-        return _eth_price_cache["value"]  # نعيد القيمة المخزنة
-    
+        return _eth_price_cache["value"]
     try:
-        # طلب سعر ETH من CoinGecko API
         async with session.get(
             "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd",
-            timeout=aiohttp.ClientTimeout(total=8),  # timeout 8 ثوانٍ كحد أقصى
+            timeout=aiohttp.ClientTimeout(total=5),
         ) as resp:
             if resp.status == 200:
-                data = await resp.json()           # تحليل الاستجابة
-                # التحقق من وجود المفتاح ethereum في الاستجابة
+                data = await resp.json()
                 if "ethereum" in data and "usd" in data["ethereum"]:
-                    price = data["ethereum"]["usd"]     # استخراج السعر
-                    _eth_price_cache["value"] = price   # تخزين القيمة
-                    _eth_price_cache["ts"] = now        # تخزين وقت التحديث
-                    logging.info(f"[السعر] تم تحديث سعر ETH: ${price}")
+                    price = data["ethereum"]["usd"]
+                    _eth_price_cache["value"] = price
+                    _eth_price_cache["ts"] = now
                     return price
-                else:
-                    logging.warning(f"[السعر] استجابة CoinGecko غير متوقعة: {data}")
-            else:
-                logging.warning(f"[السعر] CoinGecko رد بـ HTTP {resp.status}")
     except Exception as e:
-        # في حالة الخطأ، نستخدم آخر سعر معروف أو 3000 كقيمة افتراضية
-        logging.warning(f"[السعر] تعذر جلب سعر ETH: {e}")
-    
-    # نستخدم آخر سعر معروف أو 3000 كقيمة افتراضية
+        log.warning(f"[السعر] خطأ: {e}")
     return _eth_price_cache["value"] or 3000.0
 
-
-# ===================================================================
-# دوال التعامل مع OpenSea API
-# ===================================================================
-# هذه الدوال تستخدم aiohttp للتواصل مع OpenSea API بشكل غير متزامن
-
-async def fetch_drop_detail_async(session: aiohttp.ClientSession, slug: str):
-    """
-    جلب تفاصيل الدروب (المينت) من OpenSea API باستخدام aiohttp.
+# ===========================================================================
+# ✅ نظام فحص الرصيد لكل سلسلة - مع تأخير لتجنب 429
+# ===========================================================================
+async def update_all_balances_all_chains(session: aiohttp.ClientSession):
+    """تحديث رصيد جميع المحافظ على جميع السلاسل - مع تأخير لتجنب 429"""
+    global WALLET_BALANCES, LOW_BALANCE_BY_CHAIN, LOW_BALANCE_NOTIFIED
     
-    هذه الدالة غير متزامنة => أسرع من استخدام requests التقليدية.
+    eth_price = await get_eth_price(session)
     
-    المعاملات:
-        session: aiohttp.ClientSession - جلسة HTTP نشطة
-        slug: str - المعرف الفريد للمجموعة (collection slug)
-    
-    المخرجات:
-        tuple: (found: bool | None, detail: dict | None)
-        - found: True إذا وجد، False إذا 404، None إذا خطأ
-        - detail: بيانات الدروب إذا وجد، None إذا لم يوجد
-    """
-    # بناء رابط API مع الـ slug
-    url = f"{DROPS_API_BASE}/{slug}"
-    headers = {"x-api-key": OPENSEA_API_KEY}  # المصادقة بمفتاح API
-    
-    try:
-        # إرسال طلب GET غير متزامن
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            if resp.status == 200:
-                return True, await resp.json()   # نجاح: نعيد البيانات
-            if resp.status == 404:
-                return False, None               # غير موجود
-            return None, None                     # حالة أخرى غير متوقعة
-    except Exception as e:
-        logging.warning(f"[Drops API] خطأ: {e}")
-        return None, None
-
-
-def parse_iso(ts: str):
-    """
-    تحليل نص تاريخ بتنسيق ISO 8601 إلى كائن datetime.
-    
-    المعاملات:
-        ts: str - النص التاريخي (مثل "2024-01-01T12:00:00Z")
-    
-    المخرجات:
-        datetime | None - كائن datetime أو None إذا فشل التحليل
-    """
-    try:
-        # استبدال Z بـ +00:00 للتوافق مع fromisoformat
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except Exception:
-        return None  # فشل التحليل
-
-
-def started_today_local(stage: dict) -> bool:
-    """
-    التحقق مما إذا كانت مرحلة المينت قد بدأت اليوم بالتوقيت المحلي.
-    
-    المعاملات:
-        stage: dict - بيانات المرحلة (تحتوي على start_time)
-    
-    المخرجات:
-        bool - True إذا بدأت اليوم، False إذا لم تبدأ أو فشل التحليل
-    """
-    # استخراج وقت البدء من بيانات المرحلة
-    start = parse_iso(stage.get("start_time", ""))
-    if not start:
-        return False  # لا يوجد وقت بدء صالح
-    
-    # مقارنة تاريخ البدء (بالتوقيت المحلي) مع تاريخ اليوم
-    return start.astimezone(LOCAL_TZ).date() == datetime.now(LOCAL_TZ).date()
-
-
-def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
-    """
-    التحقق مما إذا كان السعر مجانيًا أو مهملاً (أقل من العتبة).
-    
-    المعاملات:
-        price_wei: int - السعر بـ Wei (أصغر وحدة في ETH)
-        eth_price_usd: float - سعر ETH الحالي
-    
-    المخرجات:
-        bool - True إذا كان مجانيًا أو أقل من العتبة
-    """
-    # إذا كان السعر 0 أو أقل، فهو مجاني
-    if price_wei == 0:
-        return True
-    
-    # تحويل السعر إلى دولار ومقارنته بالعتبة
-    price_usd = (price_wei / 1e18) * eth_price_usd
-    return price_usd < FREE_PRICE_THRESHOLD_USD
-
-
-# ===================================================================
-# نظام إشعارات تيليجرام (غير متزامن)
-# ===================================================================
-# نستخدم طابور (Queue) غير متزامن لإرسال الرسائل بشكل منظم
-# هذا يمنع إغراق API تيليجرام بالطلبات المتزامنة
-
-# طابور الرسائل: نضيف رسائل إليه، وترسل الدالة telegram_sender الرسائل بالتدريج
-send_queue: asyncio.Queue[str] = asyncio.Queue()
-
-
-def enqueue_message(text: str):
-    """
-    إضافة رسالة إلى طابور الإرسال.
-    
-    هذه الدالة آمنة للاستخدام من أي مكان في الكود.
-    الرسالة سترسل تلقائيًا عبر telegram_sender.
-    
-    المعاملات:
-        text: str - نص الرسالة المراد إرسالها
-    """
-    send_queue.put_nowait(text)
-
-
-async def telegram_sender():
-    """
-    إرسال الرسائل من الطابور إلى تيليجرام بشكل غير متزامن.
-    
-    هذه الدالة:
-    1. تنتظر ظهور رسالة في الطابور
-    2. ترسلها إلى تيليجرام
-    3. تنتظر ثانية قبل إرسال الرسالة التالية (تجنب الـ rate limit)
-    """
-    # إنشاء جلسة HTTP مشتركة (أكثر كفاءة)
-    async with aiohttp.ClientSession() as session:
-        while True:
-            # انتظار رسالة جديدة في الطابور
-            text = await send_queue.get()
+    for chain_name in ENABLED_CHAINS:
+        w3 = w3_instances.get(chain_name)
+        if not w3:
+            continue
+        
+        chain_display = CHAINS_CONFIG[chain_name]["chain_name_display"]
+        
+        if chain_name not in LOW_BALANCE_BY_CHAIN:
+            LOW_BALANCE_BY_CHAIN[chain_name] = set()
+        
+        for wallet in WALLETS:
+            wallet_address = wallet["address"]
+            
+            # ✅ تأخير بين المحافظ لتجنب 429
+            await asyncio.sleep(1.5)
             
             try:
-                # إرسال الرسالة إلى تيليجرام
-                async with session.post(
-                    f"{TELEGRAM_API}/sendMessage",
-                    data={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "text": text,
-                        "parse_mode": "HTML",  # دعم HTML في الرسائل
-                    },
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    if resp.status != 200:
-                        logging.warning(f"تيليجرام: استجابة غير متوقعة {resp.status}")
+                balance_eth, balance_wei = get_wallet_balance(w3, wallet_address)
+                balance_usd = balance_eth * eth_price
+                
+                async with BALANCE_LOCK:
+                    if wallet_address not in WALLET_BALANCES:
+                        WALLET_BALANCES[wallet_address] = {}
+                    
+                    WALLET_BALANCES[wallet_address][chain_name] = {
+                        "eth": balance_eth,
+                        "usd": balance_usd,
+                        "updated": time.time()
+                    }
+                
+                notification_key = f"{wallet_address}:{chain_name}"
+                
+                if balance_usd < MIN_BALANCE_RESERVE_USD:
+                    LOW_BALANCE_BY_CHAIN[chain_name].add(wallet_address)
+                    
+                    if notification_key not in LOW_BALANCE_NOTIFIED:
+                        LOW_BALANCE_NOTIFIED.add(notification_key)
+                        msg = (
+                            f"⚠️ <b>رصيد منخفض</b>\n"
+                            f"👛 {wallet['name']}\n"
+                            f"⛓️ {chain_display}\n"
+                            f"💰 الرصيد: ${balance_usd:.4f}\n"
+                            f"📉 الحد الأدنى: ${MIN_BALANCE_RESERVE_USD}\n"
+                            f"⏸️ تم إيقاف الشراء على {chain_display} فقط\n"
+                            f"✅ السلاسل الأخرى مستمرة"
+                        )
+                        send_telegram(msg)
+                        log.warning(f"⚠️ {wallet['name']} على {chain_display}: ${balance_usd:.4f}")
+                else:
+                    if wallet_address in LOW_BALANCE_BY_CHAIN.get(chain_name, set()):
+                        LOW_BALANCE_BY_CHAIN[chain_name].discard(wallet_address)
+                        
+                        if notification_key in LOW_BALANCE_NOTIFIED:
+                            LOW_BALANCE_NOTIFIED.discard(notification_key)
+                            msg = (
+                                f"✅ <b>عودة الرصيد</b>\n"
+                                f"👛 {wallet['name']}\n"
+                                f"⛓️ {chain_display}\n"
+                                f"💰 الرصيد: ${balance_usd:.4f}\n"
+                                f"▶️ تم استئناف الشراء على {chain_display}"
+                            )
+                            send_telegram(msg)
+                            log.info(f"✅ {wallet['name']} على {chain_display}: ${balance_usd:.4f}")
+                            
             except Exception as e:
-                logging.error(f"خطأ إرسال تليجرام: {e}")
+                if "429" in str(e):
+                    log.warning(f"⚠️ 429 - تأخير 3 ثواني لـ {wallet['name']} على {chain_display}")
+                    await asyncio.sleep(3)
+                else:
+                    log.error(f"❌ خطأ في فحص رصيد {wallet['name']} على {chain_display}: {e}")
+
+async def balance_monitor():
+    """مراقبة دورية للرصيد"""
+    log.info(f"💰 مراقبة الرصيد: كل {BALANCE_CHECK_INTERVAL} ثانية")
+    
+    async with aiohttp.ClientSession() as session:
+        # تشغيل فحص أولي فوري
+        log.info("🔍 فحص أولي للأرصدة...")
+        await update_all_balances_all_chains(session)
+        await log_balance_summary()
+        
+        while True:
+            try:
+                await asyncio.sleep(BALANCE_CHECK_INTERVAL)
+                await update_all_balances_all_chains(session)
+                await log_balance_summary()
+            except Exception as e:
+                log.error(f"[رصيد] خطأ: {e}")
+
+async def log_balance_summary():
+    """طباعة ملخص الرصيد"""
+    async with BALANCE_LOCK:
+        lines = ["\n📊 ملخص الرصيد:"]
+        
+        for wallet in WALLETS:
+            addr = wallet["address"]
+            wallet_balances = WALLET_BALANCES.get(addr, {})
             
-            # إعلام الطابور بإتمام المعالجة
-            send_queue.task_done()
+            chain_summaries = []
+            for chain_name in ENABLED_CHAINS:
+                chain_data = wallet_balances.get(chain_name, {})
+                balance_usd = chain_data.get("usd", 0)
+                is_low = addr in LOW_BALANCE_BY_CHAIN.get(chain_name, set())
+                
+                status = "🔴" if is_low else "🟢"
+                chain_display = CHAINS_CONFIG[chain_name]["chain_name_display"][:10]
+                chain_summaries.append(f"{status} {chain_display}: ${balance_usd:.4f}")
             
-            # انتظار 1.05 ثانية قبل الرسالة التالية (تجنب rate limiting)
-            await asyncio.sleep(1.05)
+            lines.append(f"  {wallet['name']}: {' | '.join(chain_summaries)}")
+        
+        log.info("\n".join(lines))
 
+def is_wallet_balance_ok(wallet_address: str, chain_name: str) -> bool:
+    """التحقق من الرصيد على سلسلة محددة"""
+    return wallet_address not in LOW_BALANCE_BY_CHAIN.get(chain_name, set())
 
-# ===================================================================
-# رسائل أسباب الفشل للعرض في تيليجرام
-# ===================================================================
-# هذه القاموس يترجم أسباب الفشل التقنية إلى نصوص عربية مفهومة
+def get_wallet_balance_for_chain(wallet_address: str, chain_name: str) -> Dict:
+    """الحصول على رصيد محفظة على سلسلة محددة"""
+    return WALLET_BALANCES.get(wallet_address, {}).get(chain_name, {"eth": 0, "usd": 0, "updated": 0})
 
-REASON_MESSAGES = {
-    "balance_too_low": "الرصيد بالمحفظة منخفض جدًا — توقف النظام عن الشراء",
-    "gas_too_high": "رسوم الغاز التقديرية تجاوزت الحد المسموح",
-    "gas_too_high_precise": "رسوم الغاز الفعلية (بعد التقدير الدقيق) تجاوزت الحد",
-    "no_fee_recipient": "تعذر تحديد عنوان الرسوم من العقد",
-    "simulation_failed": "محاكاة المعاملة فشلت — على الأغلب المينت غير متاح فعليًا",
-    "insufficient_funds_for_total_cost": "الرصيد لا يكفي سعر المينت + الغاز معًا",
-    "tx_value_too_high": "قيمة المعاملة تجاوزت الحد الأقصى المسموح به",
-    "tx_error": "خطأ أثناء إرسال المعاملة",
-}
-
-
-# دوال مساعدة لتحليل نوع المينت وأهلية المستخدم
-def check_mint_type(price_wei: int, eth_price_usd: float) -> dict:
-    """
-    تحديد نوع المينت (مدفوع/مجاني) وعرض السعر.
+# ===========================================================================
+# نظام تخزين مؤقت
+# ===========================================================================
+class DropCache:
+    def __init__(self, ttl: int = 30):
+        self.cache: Dict[str, tuple] = {}
+        self.ttl = ttl
     
-    المعاملات:
-        price_wei: int - السعر بـ Wei
-        eth_price_usd: float - سعر ETH الحالي
+    def get(self, slug: str) -> Optional[dict]:
+        if slug in self.cache:
+            data, timestamp = self.cache[slug]
+            if time.time() - timestamp < self.ttl:
+                return data
+            del self.cache[slug]
+        return None
     
-    المخرجات:
-        dict: {mint_type: str, price_usd: float, icon: str}
-    """
-    paid, price, label = is_paid_mint(price_wei, eth_price_usd)
-    return {
-        "mint_type": label,
-        "price_usd": price,
-        "icon": "💰" if paid else "🎁",
-    }
-
-
-def check_user_eligibility(reason: str, balance_usd: float = 0, gas_fee_usd: float = 0) -> dict:
-    """
-    تحديد أهلية المستخدم بناءً على سبب الفشل.
+    def set(self, slug: str, data: dict):
+        self.cache[slug] = (data, time.time())
     
-    المعاملات:
-        reason: str - سبب الفشل
-        balance_usd: float - الرصيد الحالي
-        gas_fee_usd: float - رسوم الغاز المقدرة
-    
-    المخرجات:
-        dict: {
-            eligible: bool,       # هل المستخدم مؤهل؟
-            icon: str,            # أيقونة (مؤهل/غير مؤهل)
-            label: str,           # نص وصفي
-            description: str,     # وصف تفصيلي
-            retryable: bool,      # هل يستحق إعادة المحاولة؟
-        }
-    """
-    # استخدام دالة التحليل من buyer.py
-    analysis = check_eligibility_reason(reason)
-    
-    # بناء النص الوصفي حسب نوع المشكلة
-    if analysis["eligible"]:
-        icon = "✅"
-        label = "مؤهل ✅"
-    else:
-        icon = "❌"
-        label = "غير مؤهل ❌"
-    
-    # إضافة معلومات إضافية حسب نوع المشكلة
-    extra_info = ""
-    if reason == "balance_too_low":
-        extra_info = f"\n📊 رصيدك الحالي: ${balance_usd:.4f} — الحد الأدنى المطلوب: ${MIN_BALANCE_RESERVE_USD}"
-    elif "gas_too_high" in reason:
-        extra_info = f"\n⛽ رسوم الغاز المقدرة: ${gas_fee_usd:.4f} — الحد الأقصى المسموح: ${MAX_GAS_FEE_USD}"
-    
-    return {
-        "eligible": analysis["eligible"],
-        "icon": icon,
-        "label": label,
-        "description": analysis["description"] + extra_info,
-        "retryable": analysis["retryable"],
-    }
+    def clear(self):
+        now = time.time()
+        for slug in list(self.cache.keys()):
+            _, timestamp = self.cache[slug]
+            if now - timestamp > self.ttl:
+                del self.cache[slug]
 
+drop_cache = DropCache(ttl=30)
 
-def build_result_message(detail: dict, result: dict, chain_name: str, wallet_name: str = "المحفظة") -> str:
-    """
-    بناء رسالة تيليجرام مناسبة بناءً على نتيجة العملية (نجاح أو فشل).
-    عند الفشل، تتضمن معلومات: نوع المينت (مدفوع/مجاني) وحالة الأهلية.
+# ===========================================================================
+# نظام ماسح ذكي
+# ===========================================================================
+class SmartScanner:
+    def __init__(self):
+        self.pending_slugs: Set[str] = set()
+        self.last_scan_time: Dict[str, float] = {}
+        self.scan_lock = asyncio.Lock()
+        self.batch_size = 10
     
-    المعاملات:
-        detail: dict - بيانات الدروب (اسم المجموعة، الرابط، إلخ)
-        result: dict - نتيجة عملية الشراء من buyer.py
-        chain_name: str - اسم السلسلة (robinhood أو ethereum)
-        wallet_name: str - اسم المحفظة (مثل "المحفظة 1")
+    async def add_slug(self, slug: str):
+        async with self.scan_lock:
+            if slug not in self.last_scan_time or \
+               time.time() - self.last_scan_time[slug] > MIN_SCAN_INTERVAL:
+                self.pending_slugs.add(slug)
     
-    المخرجات:
-        str - نص الرسالة المنسق بتنسيق HTML
-    """
-    # استخراج اسم المجموعة ورابطها
-    name = detail.get("collection_name") or detail.get("collection_slug")
-    url = detail.get("opensea_url", "")
-    chain_display = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
+    async def process_batch(self, session: aiohttp.ClientSession):
+        async with self.scan_lock:
+            batch = list(self.pending_slugs)[:self.batch_size]
+            for slug in batch:
+                self.pending_slugs.discard(slug)
+                self.last_scan_time[slug] = time.time()
+        
+        if not batch:
+            return
+        
+        for slug in batch:
+            await handle_discovered_mint(session, slug, "ethereum")
+            await asyncio.sleep(0.3)
+
+smart_scanner = SmartScanner()
+
+# ===========================================================================
+# OpenSea API
+# ===========================================================================
+async def fetch_drop_detail(session: aiohttp.ClientSession, slug: str, retries: int = 2):
+    cached_data = drop_cache.get(slug)
+    if cached_data:
+        return True, cached_data
     
-    # استخراج السعر (إن وجد في التفاصيل)
-    stage = detail.get("active_stage") or {}
-    price_wei = int(stage.get("price", "0"))
-    eth_price_usd = result.get("eth_price_usd", 0)
-
-    # إذا نجحت العملية => رسالة نجاح
-    if result["success"]:
-        return (
-            f"✅ <b>تم الشراء بنجاح!</b>\n\n"
-            f"المجموعة: <b>{name}</b>\n"
-            f"السلسلة: {chain_display}\n"
-            f"المحفظة: {wallet_name}\n"
-            f"الكمية: {result['quantity']}\n"
-            f"رسوم الغاز: ${result['gas_fee_usd']:.4f}\n"
-            f"معاملة: {result['tx_hash']}\n"
-            f"🔗 {url}"
-        )
-
-    # إذا فشلت => رسالة إلغاء مع ذكر السبب + معلومات الدفع والأهلية
-    reason = result.get("reason", "unknown")
-    reason_text = REASON_MESSAGES.get(reason, reason)
+    url = f"{DROPS_API_BASE}/{slug}"
+    headers = {"x-api-key": OPENSEA_API_KEY}
     
-    # معلومات الدفع (مدفوع/مجاني)
-    mint_info = check_mint_type(price_wei, eth_price_usd)
+    for attempt in range(retries):
+        try:
+            async with session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    drop_cache.set(slug, data)
+                    return True, data
+                elif resp.status == 429:
+                    await asyncio.sleep(1)
+                else:
+                    return False, None
+        except Exception:
+            if attempt == retries - 1:
+                return None, None
+            await asyncio.sleep(0.5)
     
-    # معلومات الأهلية
-    eligibility = check_user_eligibility(
-        reason, 
-        balance_usd=result.get("balance_usd", 0),
-        gas_fee_usd=result.get("gas_fee_usd", 0),
-    )
+    return None, None
+
+# ===========================================================================
+# نظام إعادة المحاولة
+# ===========================================================================
+@dataclass
+class RetryTracker:
+    slug: str
+    wallet_address: str
+    chain_name: str
+    detail: dict
+    wallet_name: str
+    wallet_private_key: str
+    price_wei: int
+    max_per_wallet: Optional[int]
+    remaining_supply: int
+    stage_name: str = ""
+    stage: dict = field(default_factory=dict)
+    original_reason: str = ""
+    config: RetryConfig = field(default_factory=lambda: get_retry_config("gas_too_high"))
+    start_time: float = field(default_factory=time.time)
+    attempt_count: int = 0
+    failure_reasons: list = field(default_factory=list)
     
-    # إضافة تفاصيل إضافية حسب سبب الفشل
-    extra = ""
-    if result.get("balance_usd"):
-        extra += f"\nالرصيد الحالي: ${result['balance_usd']:.4f}"
-    if result.get("gas_fee_usd"):
-        extra += f"\nالرسوم المقدّرة: ${result['gas_fee_usd']:.4f}"
-    if result.get("tx_hash"):
-        extra += f"\nهاش المعاملة: {result['tx_hash']}"
+    @property
+    def retry_key(self) -> str:
+        return f"{self.slug}:{self.wallet_address}:{self.chain_name}:{self.stage_name}"
+    
+    @property
+    def should_stop(self) -> bool:
+        hours_passed = (time.time() - self.start_time) / 3600
+        return hours_passed >= self.config.max_total_hours or self.attempt_count >= self.config.max_attempts
 
-    return (
-        f"⏭️ <b>تم تجاهل الشراء</b>\n\n"
-        f"المجموعة: <b>{name}</b>\n"
-        f"السلسلة: {chain_display}\n"
-        f"المحفظة: {wallet_name}\n"
-        f"السبب: {reason_text}{extra}\n\n"
-        f"─── ℹ️ معلومات التحليل ───\n"
-        f"{mint_info['icon']} نوع المينت: {mint_info['mint_type']}\n"
-        f"{eligibility['icon']} الأهلية: {eligibility['label']}\n"
-        f"📝 {eligibility['description']}\n"
-        f"🔗 {url}"
-    )
+retry_tasks: Dict[str, RetryTracker] = {}
+retry_lock = asyncio.Lock()
+mint_semaphore = asyncio.Semaphore(MAX_CONCURRENT_MINTS)
 
-
-def build_mint_info_message(detail: dict, eth_price_usd: float) -> str:
-    """
-    بناء رسالة تفصيلية بمعلومات المينت لعرضها في تيليجرام قبل أي إجراء.
-
-    تعرض: اسم المجموعة، نوع المينت (مدفوع/مجاني)، السعر، الكمية الكلية،
-    الكمية المتبقية، الحد لكل محفظة، تاريخ البدء والانتهاء، ورابط OpenSea.
-
-    المعاملات:
-        detail: dict - بيانات الدروب من OpenSea API
-        eth_price_usd: float - سعر ETH الحالي بالدولار
-
-    المخرجات:
-        str - نص الرسالة المنسق بتنسيق HTML
-    """
+# ===========================================================================
+# ✅ بناء الرسائل - مع تحسين الشكل
+# ===========================================================================
+def build_free_mint_report(detail: dict, chain_name: str, eth_price: float, free_stages: dict) -> str:
+    """تقرير عن المراحل المجانية"""
     name = detail.get("collection_name") or detail.get("collection_slug", "غير معروف")
     url = detail.get("opensea_url", "")
-
-    stage = detail.get("active_stage") or {}
-    price_wei = int(stage.get("price", "0") or "0")
-
-    # تحديد السعر ونوع المينت
-    paid, price_usd, _label = is_paid_mint(price_wei, eth_price_usd)
-    price_eth = price_wei / 1e18 if price_wei > 0 else 0
-    if paid:
-        price_str = f"💰 مدفوع: {price_eth:.4f} ETH (≈ ${price_usd:.2f})"
-        header_icon = "💰"
-        mint_type = "مدفوع"
-        action_note = "⏭️ مينت مدفوع — سيتم التجاهل تلقائياً"
-    else:
-        price_str = "🎁 مجاني"
-        header_icon = "🎁"
-        mint_type = "مجاني"
-        action_note = "⏳ جاري الشراء التلقائي..."
-
-    # تنسيق التواريخ بالتوقيت المحلي
-    def fmt_date(ts: str) -> str:
-        if not ts:
-            return "غير محدد"
-        dt = parse_iso(ts)
-        if not dt:
-            return ts[:16] if len(ts) >= 16 else ts
-        return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%d %H:%M")
-
-    start_str = fmt_date(stage.get("start_time", ""))
-    end_str = fmt_date(stage.get("end_time", ""))
-
-    # الكميات
+    chain_display = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
     max_supply = int(detail.get("max_supply") or 0)
     total_supply = int(detail.get("total_supply") or 0)
     remaining = max(0, max_supply - total_supply)
+    
+    active_stages = free_stages.get("active", [])
+    upcoming_stages = free_stages.get("upcoming", [])
+    
+    ready_wallets = sum(1 for w in WALLETS if is_wallet_balance_ok(w["address"], chain_name))
+    low_wallets = len(WALLETS) - ready_wallets
+    
+    lines = [
+        f"🎁 <b>مراحل مجانية مكتشفة!</b>",
+        f"",
+        f"📦 <b>{name}</b>",
+        f"⛓️ {chain_display}",
+        f"📊 المتبقي: {remaining:,}/{max_supply:,}",
+        f"👛 المحافظ الجاهزة: {ready_wallets}/{len(WALLETS)}",
+    ]
+    
+    if low_wallets > 0:
+        lines.append(f"⚠️ محافظ منخفضة الرصيد: {low_wallets}")
+    
+    lines.append("")
+    
+    if active_stages:
+        lines.append(f"✅ <b>مراحل نشطة ({len(active_stages)}):</b>")
+        for stage in active_stages:
+            stage_name = stage.get("stage", "مرحلة")
+            max_wallet = stage.get("max_per_wallet", "غير محدد")
+            lines.append(f"  • {stage_name} (الحد: {max_wallet})")
+        lines.append("")
+    
+    if upcoming_stages:
+        lines.append(f"⏳ <b>مراحل قادمة ({len(upcoming_stages)}):</b>")
+        for stage in upcoming_stages:
+            stage_name = stage.get("stage", "مرحلة")
+            start_dt = stage.get("start_dt")
+            if start_dt:
+                start_local = start_dt.astimezone(LOCAL_TZ).strftime("%H:%M")
+                lines.append(f"  • {stage_name} (يبدأ: {start_local})")
+        lines.append("")
+    
+    lines.append(f"🔗 <a href='{url}'>OpenSea</a>")
+    
+    return "\n".join(lines)
 
-    # الحد الأقصى لكل محفظة
-    max_per_wallet_raw = stage.get("max_per_wallet")
-    max_per_wallet_str = str(max_per_wallet_raw) if max_per_wallet_raw is not None else "غير محدد"
 
-    return (
-        f"{header_icon} <b>مينت {mint_type} نشط!</b>\n\n"
-        f"📦 المجموعة: <b>{name}</b>\n"
-        f"💲 السعر: {price_str}\n"
-        f"📊 الكمية الكلية: {max_supply:,}\n"
-        f"✅ المتبقي: {remaining:,} قطعة\n"
-        f"👛 الحد لكل محفظة: {max_per_wallet_str}\n"
-        f"🕐 بدأ: {start_str}\n"
-        f"🕔 ينتهي: {end_str}\n"
-        f"ℹ️ {action_note}\n"
-        f"🔗 {url}"
-    )
+def build_multi_wallet_success_msg(detail: dict, results: List[MintResult], chain_name: str, stage_name: str) -> str:
+    """رسالة نجاح لعدة محافظ"""
+    name = detail.get("collection_name") or detail.get("collection_slug", "")
+    url = detail.get("opensea_url", "")
+    chain_display = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
+    explorer_url = CHAINS_CONFIG.get(chain_name, {}).get("explorer_url", "")
+    
+    success_results = [r for r in results if r.success]
+    fail_results = [r for r in results if not r.success]
+    
+    low_balance_fails = [r for r in fail_results if r.reason in ["balance_too_low", "insufficient_funds"]]
+    other_fails = [r for r in fail_results if r.reason not in ["balance_too_low", "insufficient_funds"]]
+    
+    lines = [
+        f"📊 <b>نتائج الشراء</b>",
+        f"",
+        f"📦 <b>{name}</b>",
+        f"🎯 {stage_name}",
+        f"⛓️ {chain_display}",
+        f"",
+    ]
+    
+    if success_results:
+        lines.append(f"✅ <b>نجاح ({len(success_results)} محفظة):</b>")
+        for r in success_results:
+            gas_info = f"${r.gas_used_usd:.4f}" if r.gas_used_usd > 0 else "غير معروف"
+            tx_link = f"<a href='{explorer_url}{r.tx_hash}'>TX</a>" if r.tx_hash else "لا يوجد"
+            lines.append(f"  • {r.wallet_name or r.wallet[:10]}: {r.quantity} قطعة | ⛽ {gas_info} | {tx_link}")
+    
+    if other_fails:
+        lines.append(f"")
+        lines.append(f"❌ <b>فشل ({len(other_fails)} محفظة):</b>")
+        for r in other_fails:
+            reason = r.reason_text or get_reason_text(r.reason)
+            lines.append(f"  • {r.wallet_name or r.wallet[:10]}: {reason}")
+    
+    if low_balance_fails:
+        lines.append(f"")
+        lines.append(f"💰 <b>رصيد منخفض ({len(low_balance_fails)} محفظة):</b>")
+        for r in low_balance_fails:
+            lines.append(f"  • {r.wallet_name or r.wallet[:10]}: ${r.balance_usd:.4f}")
+    
+    lines.append(f"")
+    lines.append(f"🔗 <a href='{url}'>OpenSea</a>")
+    
+    return "\n".join(lines)
 
-
-# ===================================================================
-# دوال نظام إعادة المحاولة (Retry System)
-# ===================================================================
-
-
-async def schedule_retry(
+# ===========================================================================
+# ✅ معالجة الشراء - مع إشعارات فورية
+# ===========================================================================
+async def process_stage_for_all_wallets(
     session: aiohttp.ClientSession,
-    tracker: RetryTracker,
-):
-    """
-    جدولة إعادة المحاولة بعد ساعة واحدة.
+    slug: str,
+    detail: dict,
+    stage: dict,
+    chain_name: str,
+) -> List[MintResult]:
+    """معالجة مرحلة لجميع المحافظ"""
     
-    هذه الدالة:
-    1. تنتظر ساعة كاملة
-    2. تتحقق مما إذا كانت المدة (8 ساعات) قد انتهت
-    3. إذا لم تنته، تعيد محاولة الشراء
-    4. ترسل رسائل تيليجرام مناسبة
+    stage_name = stage.get("stage", "عام")
+    price_wei = int(stage.get("price_wei", "0") or "0")
+    max_per_wallet = stage.get("max_per_wallet")
+    if max_per_wallet is not None:
+        max_per_wallet = int(max_per_wallet)
     
-    المعاملات:
-        session: aiohttp.ClientSession - جلسة HTTP مشتركة
-        tracker: RetryTracker - كائن تتبع المحاولات
-    """
+    max_supply = int(detail.get("max_supply") or 0)
+    total_supply = int(detail.get("total_supply") or 0)
+    remaining = max(0, max_supply - total_supply)
+    
+    if remaining <= 0:
+        log.info(f"⏭️ '{slug}' - نفذت الكمية")
+        return []
+    
+    contract_address = detail.get("contract_address")
+    if not contract_address:
+        log.warning(f"⚠️ '{slug}': لا يوجد contract_address")
+        return []
+    
+    eth_price = await get_eth_price(session)
+    
+    if not is_price_free(price_wei):
+        return []
+    
+    chain_display = CHAINS_CONFIG[chain_name]["chain_name_display"]
+    
+    wallet_tasks = []
+    valid_wallets = []
+    skipped_wallets = []
+    
+    for wallet in WALLETS:
+        if not is_wallet_balance_ok(wallet["address"], chain_name):
+            balance_data = get_wallet_balance_for_chain(wallet["address"], chain_name)
+            skipped_wallets.append(f"{wallet['name']} (${balance_data.get('usd', 0):.4f})")
+            continue
+        valid_wallets.append(wallet)
+        wallet_tasks.append(
+            process_stage_for_wallet(session, slug, detail, stage, chain_name, wallet, eth_price)
+        )
+    
+    if not wallet_tasks:
+        return []
+    
+    log.info(f"🔥 '{slug}' - {stage_name} على {chain_display}: شراء من {len(wallet_tasks)} محفظة")
+    
+    # إشعار ببدء الشراء
+    send_telegram(
+        f"🚀 <b>بدء الشراء</b>\n"
+        f"📦 {detail.get('collection_name', slug)}\n"
+        f"⛓️ {chain_display}\n"
+        f"👛 {len(wallet_tasks)} محفظة\n"
+        f"⏭️ تم تخطي: {len(skipped_wallets)}"
+    )
+    
+    results = await asyncio.gather(*wallet_tasks, return_exceptions=True)
+    
+    final_results = []
+    for r in results:
+        if isinstance(r, Exception):
+            log.error(f"❌ خطأ: {r}")
+        elif r is not None:
+            r.chain_name = chain_name
+            final_results.append(r)
+    
+    if final_results:
+        success_count = sum(1 for r in final_results if r.success)
+        
+        # إرسال تقرير النتائج
+        msg = build_multi_wallet_success_msg(detail, final_results, chain_name, stage_name)
+        send_telegram(msg)
+        
+        # إشعار فردي لكل نجاح
+        for r in final_results:
+            if r.success:
+                send_telegram(
+                    f"✅ <b>تم الشراء!</b>\n"
+                    f"👛 {r.wallet_name or r.wallet[:10]}\n"
+                    f"📦 {detail.get('collection_name', slug)}\n"
+                    f"📊 {r.quantity} قطعة\n"
+                    f"⛽ ${r.gas_used_usd:.4f}"
+                )
+        
+        log.info(f"📊 '{slug}': ✅{success_count} ❌{len(final_results) - success_count} ⏭️{len(skipped_wallets)}")
+    
+    return final_results
+
+
+async def process_stage_for_wallet(
+    session: aiohttp.ClientSession,
+    slug: str,
+    detail: dict,
+    stage: dict,
+    chain_name: str,
+    wallet: dict,
+    eth_price: float,
+) -> Optional[MintResult]:
+    """معالجة مرحلة لمحفظة واحدة"""
+    wallet_name = wallet["name"]
+    wallet_address = wallet["address"]
+    wallet_private_key = wallet["private_key"]
+    
+    w3 = w3_instances.get(chain_name)
+    if not w3:
+        return None
+    
+    seadrop_address = CHAINS_CONFIG[chain_name]["seadrop_address"]
+    stage_name = stage.get("stage", "عام")
+    price_wei = int(stage.get("price_wei", "0") or "0")
+    max_per_wallet = stage.get("max_per_wallet")
+    if max_per_wallet is not None:
+        max_per_wallet = int(max_per_wallet)
+    
+    max_supply = int(detail.get("max_supply") or 0)
+    total_supply = int(detail.get("total_supply") or 0)
+    remaining = max(0, max_supply - total_supply)
+    
+    contract_address = detail.get("contract_address")
+    chain_display = CHAINS_CONFIG[chain_name]["chain_name_display"]
+    
+    checks = quick_checks(w3, wallet_address, eth_price, contract_address, seadrop_address, 1, price_wei)
+    
+    if not checks["pass"]:
+        reason = checks["reason"]
+        result = MintResult(
+            success=False,
+            wallet=wallet_address,
+            wallet_name=wallet_name,
+            reason=reason,
+            reason_text=get_reason_text(reason),
+            balance_usd=checks.get("balance_usd", 0),
+            chain_name=chain_name,
+        )
+        
+        # إشعار فوري بالفشل
+        if reason not in ["balance_too_low", "insufficient_funds"]:
+            send_telegram(
+                f"❌ <b>فشل الفحص</b>\n"
+                f"👛 {wallet_name}\n"
+                f"📦 {detail.get('collection_name', slug)}\n"
+                f"⚠️ {get_reason_text(reason)}"
+            )
+        
+        if reason in RETRYABLE_REASONS and reason not in ["balance_too_low", "insufficient_funds"]:
+            await schedule_retry(session, slug, detail, stage, chain_name, wallet, reason)
+        
+        return result
+    
+    log.info(f"🚀 '{slug}' - {wallet_name} على {chain_display}: بدء الشراء...")
+    
+    async with mint_semaphore:
+        result = await asyncio.to_thread(
+            attempt_purchase,
+            w3=w3,
+            private_key=wallet_private_key,
+            wallet_address=wallet_address,
+            nft_contract=contract_address,
+            seadrop_address=seadrop_address,
+            price_wei=price_wei,
+            max_per_wallet=max_per_wallet,
+            remaining_supply=remaining,
+            eth_price_usd=eth_price,
+        )
+    
+    if result:
+        result.wallet_name = wallet_name
+        result.chain_name = chain_name
+    
+    if result and result.success:
+        log.info(f"✅ '{slug}' - {wallet_name}: نجاح!")
+        send_telegram(
+            f"✅ <b>تم الشراء!</b>\n"
+            f"👛 {wallet_name}\n"
+            f"📦 {detail.get('collection_name', slug)}\n"
+            f"⛓️ {chain_display}\n"
+            f"🎯 {stage_name}\n"
+            f"📊 {result.quantity} قطعة\n"
+            f"⛽ ${result.gas_used_usd:.4f}"
+        )
+        await update_single_wallet_balance(session, wallet_address, chain_name)
+    elif result:
+        reason_text = result.reason_text or get_reason_text(result.reason)
+        log.info(f"❌ '{slug}' - {wallet_name}: {reason_text}")
+        
+        if result.reason not in ["balance_too_low", "insufficient_funds"]:
+            send_telegram(
+                f"❌ <b>فشل الشراء</b>\n"
+                f"👛 {wallet_name}\n"
+                f"📦 {detail.get('collection_name', slug)}\n"
+                f"⚠️ {reason_text}"
+            )
+        
+        if result.reason in RETRYABLE_REASONS and result.reason not in ["balance_too_low", "insufficient_funds"]:
+            await schedule_retry(session, slug, detail, stage, chain_name, wallet, result.reason)
+    
+    return result
+
+
+async def update_single_wallet_balance(session: aiohttp.ClientSession, wallet_address: str, chain_name: str):
+    """تحديث رصيد محفظة واحدة"""
+    try:
+        eth_price = await get_eth_price(session)
+        w3 = w3_instances.get(chain_name)
+        if not w3:
+            return
+        
+        balance_eth, _ = get_wallet_balance(w3, wallet_address)
+        balance_usd = balance_eth * eth_price
+        
+        async with BALANCE_LOCK:
+            if wallet_address not in WALLET_BALANCES:
+                WALLET_BALANCES[wallet_address] = {}
+            
+            WALLET_BALANCES[wallet_address][chain_name] = {
+                "eth": balance_eth,
+                "usd": balance_usd,
+                "updated": time.time()
+            }
+            
+            if balance_usd < MIN_BALANCE_RESERVE_USD:
+                if chain_name not in LOW_BALANCE_BY_CHAIN:
+                    LOW_BALANCE_BY_CHAIN[chain_name] = set()
+                LOW_BALANCE_BY_CHAIN[chain_name].add(wallet_address)
+            else:
+                if chain_name in LOW_BALANCE_BY_CHAIN:
+                    LOW_BALANCE_BY_CHAIN[chain_name].discard(wallet_address)
+    except Exception as e:
+        log.error(f"❌ خطأ في تحديث رصيد {wallet_address[:10]}: {e}")
+
+
+async def schedule_retry(session, slug, detail, stage, chain_name, wallet, reason):
+    """جدولة إعادة المحاولة"""
+    if reason in ["balance_too_low", "insufficient_funds"]:
+        return
+    
+    stage_name = stage.get("stage", "عام")
+    price_wei = int(stage.get("price_wei", "0") or "0")
+    max_per_wallet = stage.get("max_per_wallet")
+    if max_per_wallet is not None:
+        max_per_wallet = int(max_per_wallet)
+    
+    max_supply = int(detail.get("max_supply") or 0)
+    total_supply = int(detail.get("total_supply") or 0)
+    remaining = max(0, max_supply - total_supply)
+    
+    config = get_retry_config(reason)
+    
+    async with retry_lock:
+        key = f"{slug}:{wallet['address']}:{chain_name}:{stage_name}"
+        
+        if key in retry_tasks:
+            existing = retry_tasks[key]
+            existing.failure_reasons.append(reason)
+            return
+        
+        tracker = RetryTracker(
+            slug=slug,
+            wallet_address=wallet["address"],
+            chain_name=chain_name,
+            detail=detail,
+            wallet_name=wallet["name"],
+            wallet_private_key=wallet["private_key"],
+            price_wei=price_wei,
+            max_per_wallet=max_per_wallet,
+            remaining_supply=remaining,
+            stage_name=stage_name,
+            stage=stage,
+            original_reason=reason,
+            config=config,
+        )
+        retry_tasks[key] = tracker
+        
+        send_telegram(
+            f"🔄 <b>إعادة محاولة</b>\n"
+            f"👛 {wallet['name']}\n"
+            f"📦 {detail.get('collection_name', slug)}\n"
+            f"⚠️ {get_reason_text(reason)}\n"
+            f"⏱️ كل {config.base_delay} ثانية"
+        )
+        
+        asyncio.create_task(retry_loop(session, tracker))
+
+
+async def retry_loop(session: aiohttp.ClientSession, tracker: RetryTracker):
+    """حلقة إعادة المحاولة"""
     key = tracker.retry_key
-    name = tracker.detail.get("collection_name") or tracker.detail.get("collection_slug", "")
+    name = tracker.detail.get("collection_name", tracker.slug)
     chain_display = CHAINS_CONFIG.get(tracker.chain_name, {}).get("chain_name_display", tracker.chain_name)
     
     while True:
-        # انتظار ساعة واحدة قبل المحاولة التالية
-        await asyncio.sleep(RETRY_INTERVAL)
-        
-        async with retry_lock:
-            # التحقق من أن المهمة لا تزال مسجلة (لم يتم إلغاؤها)
-            if key not in retry_tasks:
-                return  # تم إلغاء المهمة
-            
-            # التحقق من انتهاء المدة (8 ساعات)
-            if tracker.is_expired:
-                # إرسال رسالة انتهاء المحاولات
-                msg = RETRY_MESSAGES["retry_expired"].format(
-                    name=name,
-                    chain=chain_display,
-                    wallet=tracker.wallet_name,
-                    attempts=tracker.attempt_count,
-                    hours=MAX_RETRY_HOURS,
-                )
-                enqueue_message(msg)
-                
-                # حذف المهمة من قاموس التتبع
-                del retry_tasks[key]
-                logging.info(f"⏰ انتهت محاولات إعادة الشراء لـ '{name}' - {tracker.wallet_name} على {chain_display}")
-                return  # خروج من الحلقة
-        
-        # زيادة عداد المحاولات
         tracker.attempt_count += 1
+        delay = calculate_retry_delay(tracker.config, tracker.attempt_count)
         
-        # إرسال رسالة تنبيه بإعادة المحاولة
+        await asyncio.sleep(delay)
+        
         async with retry_lock:
-            if key not in retry_tasks:
-                return  # تم إلغاء المهمة أثناء الانتظار
-            
-            hours_remaining = tracker.hours_remaining
-            msg = RETRY_MESSAGES["retry_starting"].format(
-                name=name,
-                chain=chain_display,
-                wallet=tracker.wallet_name,
-                attempt=tracker.attempt_count,
-                max_retries=MAX_RETRIES_PER_TASK,
-                reason=tracker.original_reason,
-                hours_remaining=f"{hours_remaining:.1f}",
-            )
-            enqueue_message(msg)
-        
-        logging.info(f"🔄 إعادة محاولة '{name}' - {tracker.wallet_name} على {chain_display} (محاولة {tracker.attempt_count}/{MAX_RETRIES_PER_TASK})")
-        
-        # --- تنفيذ محاولة الشراء ---
-        try:
-            w3 = w3_instances.get(tracker.chain_name)
-            if not w3:
-                logging.warning(f"⚠️ لا يوجد اتصال Web3 لـ {tracker.chain_name} أثناء إعادة المحاولة")
-                async with retry_lock:
-                    if key in retry_tasks:
-                        del retry_tasks[key]
+            if key not in retry_tasks or tracker.should_stop:
+                retry_tasks.pop(key, None)
                 return
+        
+        if not is_wallet_balance_ok(tracker.wallet_address, tracker.chain_name):
+            continue
+        
+        found, updated = await fetch_drop_detail(session, tracker.slug)
+        if found and updated:
+            tracker.detail = updated
+            ms = int(updated.get("max_supply") or 0)
+            ts = int(updated.get("total_supply") or 0)
+            tracker.remaining_supply = max(0, ms - ts)
             
-            chain_config = CHAINS_CONFIG[tracker.chain_name]
-            seadrop_address = chain_config["seadrop_address"]
-            
-            # جلب سعر ETH محدث
-            eth_price_usd = await get_eth_price_usd(session)
-            tracker.eth_price_usd = eth_price_usd
-            
-            # فحوصات سريعة قبل المحاولة
-            checks = quick_checks(
-                w3, tracker.wallet_address, eth_price_usd,
-                tracker.detail.get("contract_address", ""), seadrop_address,
-            )
-            
-            if not checks["pass"]:
-                # الفشل بسبب مشكلة لا تزال قائمة - استمر في المحاولة لاحقًا
-                reason = checks["reason"]
-                logging.info(f"⏭️ إعادة المحاولة فشلت: {reason}")
-                
-                # إرسال رسالة فشل إعادة المحاولة
-                failure_result = {
-                    "success": False,
-                    "reason": reason,
-                    "balance_usd": checks.get("balance_usd", 0),
-                    "gas_fee_usd": checks.get("gas_fee_usd", 0),
-                    "eth_price_usd": eth_price_usd,
-                }
-                fail_msg = build_result_message(tracker.detail, failure_result, tracker.chain_name, tracker.wallet_name)
-                fail_msg += f"\n\n🔄 ستتم المحاولة التالية بعد ساعة (المحاولة {tracker.attempt_count}/{MAX_RETRIES_PER_TASK})"
-                enqueue_message(fail_msg)
-                
-                # استمر في الحلقة (انتظر ساعة أخرى)
-                continue
-            
-            # تنفيذ الشراء الفعلي
+            if tracker.remaining_supply <= 0:
+                async with retry_lock:
+                    retry_tasks.pop(key, None)
+                return
+        
+        w3 = w3_instances.get(tracker.chain_name)
+        if not w3:
+            continue
+        
+        eth_price = await get_eth_price(session)
+        contract = tracker.detail.get("contract_address")
+        seadrop = CHAINS_CONFIG[tracker.chain_name]["seadrop_address"]
+        
+        async with mint_semaphore:
             result = await asyncio.to_thread(
                 attempt_purchase,
-                w3, tracker.wallet_private_key, tracker.wallet_address,
-                tracker.detail.get("contract_address", ""), seadrop_address,
-                tracker.price_wei, tracker.max_per_wallet, tracker.remaining_supply, eth_price_usd,
+                w3=w3,
+                private_key=tracker.wallet_private_key,
+                wallet_address=tracker.wallet_address,
+                nft_contract=contract,
+                seadrop_address=seadrop,
+                price_wei=tracker.price_wei,
+                max_per_wallet=tracker.max_per_wallet,
+                remaining_supply=tracker.remaining_supply,
+                eth_price_usd=eth_price,
             )
-            
-            if isinstance(result, dict):
-                if result.get("success"):
-                    # نجاح! إرسال رسالة نجاح وإزالة المهمة
-                    msg = RETRY_MESSAGES["retry_success"].format(
-                        name=name,
-                        chain=chain_display,
-                        wallet=tracker.wallet_name,
-                        attempt=tracker.attempt_count,
-                        max_retries=MAX_RETRIES_PER_TASK,
-                        quantity=result.get("quantity", 0),
-                        gas_fee=result.get("gas_fee_usd", 0),
-                        tx_hash=result.get("tx_hash", ""),
-                    )
-                    enqueue_message(msg)
-                    
-                    async with retry_lock:
-                        if key in retry_tasks:
-                            del retry_tasks[key]
-                    logging.info(f"✅ نجحت إعادة المحاولة لـ '{name}' - {tracker.wallet_name} على {chain_display}")
-                    return  # نجاح - خروج
-                else:
-                    # فشل - استمر في المحاولة
-                    reason = result.get("reason", "unknown")
-                    logging.info(f"⏭️ إعادة المحاولة فشلت: {reason}")
-                    
-                    # إرسال رسالة فشل
-                    result["eth_price_usd"] = eth_price_usd
-                    fail_msg = build_result_message(tracker.detail, result, tracker.chain_name, tracker.wallet_name)
-                    fail_msg += f"\n\n🔄 ستتم المحاولة التالية بعد ساعة (المحاولة {tracker.attempt_count}/{MAX_RETRIES_PER_TASK})"
-                    enqueue_message(fail_msg)
-                    
-                    # استمر في الحلقة
-                    continue
-            else:
-                logging.error(f"❌ نتيجة غير متوقعة في إعادة المحاولة: {result}")
-                continue
-                
-        except Exception as e:
-            logging.error(f"❌ خطأ أثناء إعادة المحاولة: {e}")
-            # استمر في الحلقة (حاول مرة أخرى)
-            continue
+        
+        if result and result.success:
+            ex = CHAINS_CONFIG.get(tracker.chain_name, {}).get("explorer_url", "")
+            send_telegram(
+                f"✅ <b>نجحت الإعادة!</b>\n"
+                f"📦 {name}\n"
+                f"👛 {tracker.wallet_name}\n"
+                f"⛓️ {chain_display}\n"
+                f"🔄 محاولة #{tracker.attempt_count}\n"
+                f"📊 {result.quantity} قطعة\n"
+                f"🔗 <a href='{ex}{result.tx_hash}'>المعاملة</a>"
+            )
+            async with retry_lock:
+                retry_tasks.pop(key, None)
+            await update_single_wallet_balance(session, tracker.wallet_address, tracker.chain_name)
+            return
 
-
-# ===================================================================
-# منطق التحقق والشراء الأساسي (معالجة مجموعة واحدة)
-# ===================================================================
-# هذه الدالة هي قلب النظام:
-# 1. تجلب تفاصيل الدروب
-# 2. تتحقق من أنه مينت مجاني بدأ اليوم
-# 3. تجري الفحوصات السريعة على كل سلسلة لكل محفظة
-# 4. تنفذ عمليات الشراء بالتوازي (كل محفظة × كل سلسلة)
-# 5. عند الفشل، تجدول إعادة المحاولة (لمدة 8 ساعات)
-
-async def evaluate_and_buy(
-    session: aiohttp.ClientSession,
-    slug: str,
-    notified: set,
-    known_external: set,
-    checking: set,
-):
-    """
-    معالجة مجموعة واحدة: فحص + شراء من جميع المحافظ على جميع السلاسل بالتوازي.
+# ===========================================================================
+# ✅ معالجة المينت المكتشف
+# ===========================================================================
+async def handle_discovered_mint(session, slug, chain_name):
+    """معالجة مينت مكتشف"""
+    global NOTIFIED, CHECKING
     
-    هذه الدالة تتخذ القرارات التالية:
-    - هل المينت مجاني؟ (إذا لا، نتجاهل)
-    - هل بدأ اليوم؟ (إذا لا، نتجاهل)
-    - هل هناك كمية متبقية؟ (إذا لا، نتجاهل)
-    - هل الرصيد والغاز مناسبان؟ (إذا لا، نلغي لكل محفظة/سلسلة على حدة)
-    - شراء من جميع المحافظ والسلاسل المؤهلة بالتوازي
-    - عند الفشل، جدولة إعادة المحاولة
-    
-    كل محفظة تشتري بشكل مستقل عن الأخرى.
-    كل محفظة تجرب على جميع السلاسل المتاحة.
-    """
     try:
-        # الخطوة 1: جلب تفاصيل الدروب من OpenSea API
-        found, detail = await fetch_drop_detail_async(session, slug)
+        found, detail = await fetch_drop_detail(session, slug)
+        
         if not found or not detail:
-            known_external.add(slug)  # نضيف للمجموعات المعروفة (غير صالحة)
+            async with CHECKING_LOCK:
+                CHECKING.discard(slug)
             return
         
-        # الخطوة 2: التحقق من أن المينت نشط (is_minting = true)
-        if not detail.get("is_minting"):
-            known_external.add(slug)
+        ms = int(detail.get("max_supply") or 0)
+        ts = int(detail.get("total_supply") or 0)
+        if ms - ts <= 0:
+            async with CHECKING_LOCK:
+                CHECKING.discard(slug)
+                NOTIFIED.add(slug)
             return
-
-        # الخطوة 3: التحقق من وجود مرحلة نشطة
-        # (تم إلغاء شرط "بدأ اليوم" — النظام يتعامل مع أي مينت نشط في السوق)
-        stage = detail.get("active_stage")
-        if not stage:
-            known_external.add(slug)
-            logging.info(f"⏭️ '{slug}': لا توجد مرحلة نشطة — تم تجاهله.")
+        
+        eth_price = await get_eth_price(session)
+        free_stages = find_all_free_stages(detail, WALLETS)
+        
+        has_active = len(free_stages["active"]) > 0
+        has_upcoming = len(free_stages["upcoming"]) > 0
+        
+        if not has_active and not has_upcoming:
+            async with CHECKING_LOCK:
+                CHECKING.discard(slug)
             return
-
-        # الخطوة 4: حساب الكمية المتبقية
-        max_supply = int(detail.get("max_supply") or 0)       # أقصى كمية
-        total_supply = int(detail.get("total_supply") or 0)   # الكمية المسكوكة
-        remaining = max_supply - total_supply                  # الكمية المتبقية
-        if remaining <= 0:                                     # إذا نفد، نتجاهل
-            known_external.add(slug)
-            return
-
-        # الخطوة 5: جلب سعر ETH وفحص نوع المينت
-        price_wei = int(stage.get("price", "0") or "0")       # السعر بـ Wei
-        eth_price_usd = await get_eth_price_usd(session)       # سعر ETH الحالي
-
-        # إرسال رسالة تفصيلية بمعلومات المينت إلى تيليجرام
-        info_msg = build_mint_info_message(detail, eth_price_usd)
-        enqueue_message(info_msg)
-
-        if not is_free_or_negligible(price_wei, eth_price_usd):
-            # مينت مدفوع — عرض المعلومات فقط وتجاهل الشراء
-            known_external.add(slug)
-            logging.info(f"💰 '{slug}': مينت مدفوع ({price_wei} wei) — تم عرض المعلومات فقط.")
-            return
-
-        # الخطوة 6: استخراج عنوان العقد
-        contract_address = detail.get("contract_address")
-        if not contract_address:
-            logging.warning(f"⏭️ '{slug}': لا يوجد contract_address بالبيانات.")
-            known_external.add(slug)
-            return
-
-        # الخطوة 7: استخراج الحد الأقصى لكل محفظة
-        max_per_wallet_raw = stage.get("max_per_wallet")
-        max_per_wallet = int(max_per_wallet_raw) if max_per_wallet_raw is not None else None
-
-        # نضيف slug إلى قائمة المجموعات التي تم إشعار المستخدم بها
-        notified.add(slug)
-
-        # ===============================================================
-        # تنفيذ الشراء من جميع المحافظ المتاحة على جميع السلاسل بالتوازي
-        # ===============================================================
-        if not w3_instances:
-            logging.warning("⚠️ لا توجد سلاسل نشطة للشراء.")
-            return
-        if not WALLETS:
-            logging.warning("⚠️ لا توجد محافظ مفعلة.")
-            enqueue_message(f"⚠️ لا توجد محافظ مفعلة للمجموعة {slug}")
-            return
-
-        # تجهيز قائمة المهام (كل محفظة × كل سلسلة = مهمة واحدة)
-        tasks = []
-        for wallet in WALLETS:
-            wallet_name = wallet["name"]
-            wallet_address = wallet["address"]
-            wallet_private_key = wallet["private_key"]
-            
-            for chain_name in ENABLED_CHAINS:
-                w3 = w3_instances.get(chain_name)
-                if not w3:
-                    continue  # تخطي إذا لم يكن هناك اتصال
-
-                chain_config = CHAINS_CONFIG[chain_name]
-                seadrop_address = chain_config["seadrop_address"]  # عنوان عقد SeaDrop
-
-                # --- فحوصات سريعة أولية لمنع إهدار الوقت ---
-                # نتحقق من الرصيد، الغاز، وعنوان الرسوم قبل بناء المعاملة
-                checks = quick_checks(
-                    w3, wallet_address, eth_price_usd,
-                    contract_address, seadrop_address,
-                )
-                if not checks["pass"]:
-                    reason = checks["reason"]
-                    logging.info(f"⏭️ '{slug}' على {chain_name} - {wallet_name}: {reason}")
-                    
-                    # نرسل إشعار بالفشل لهذه المحفظة/السلسلة
-                    result = {
-                        "success": False,
-                        "reason": reason,
-                        "balance_usd": checks.get("balance_usd", 0),
-                        "gas_fee_usd": checks.get("gas_fee_usd", 0),
-                        "eth_price_usd": eth_price_usd,
-                    }
-                    enqueue_message(build_result_message(detail, result, chain_name, wallet_name))
-                    
-                    # --- جدولة إعادة المحاولة إذا كان السبب قابلاً لإعادة المحاولة ---
-                    if reason in RETRYABLE_REASONS:
-                        async with retry_lock:
-                            retry_key = f"{slug}:{wallet_address}:{chain_name}"
-                            # نتأكد أن المهمة غير مسجلة مسبقًا
-                            if retry_key not in retry_tasks:
-                                tracker = RetryTracker(
-                                    slug=slug,
-                                    wallet_address=wallet_address,
-                                    chain_name=chain_name,
-                                    detail=detail,
-                                    wallet_name=wallet_name,
-                                    wallet_private_key=wallet_private_key,
-                                    price_wei=price_wei,
-                                    max_per_wallet=max_per_wallet,
-                                    remaining_supply=remaining,
-                                    eth_price_usd=eth_price_usd,
-                                    original_reason=reason,
-                                )
-                                retry_tasks[retry_key] = tracker
-                                # إنشاء مهمة إعادة محاولة غير متزامنة
-                                asyncio.create_task(schedule_retry(session, tracker))
-                                logging.info(f"🔄 تمت جدولة إعادة المحاولة لـ '{slug}' - {wallet_name} على {chain_name} (السبب: {reason})")
-                    
-                    continue  # ننتقل للمحفظة/السلسلة التالية
-
-                # --- تجهيز مهمة الشراء (في Thread منفصل لتجنب حظر الحدث) ---
-                # نستخدم asyncio.to_thread لتشغيل الدالة المتزامنة في Thread منفصل
-                # هذا يسمح بتنفيذ عدة عمليات شراء بالتوازي دون حظر
-                tasks.append(
-                    (wallet_name, chain_name, wallet_address, wallet_private_key, asyncio.to_thread(
-                        attempt_purchase,
-                        w3, wallet_private_key, wallet_address,
-                        contract_address, seadrop_address,
-                        price_wei, max_per_wallet, remaining, eth_price_usd,
-                    ))
-                )
-
-        # إذا لم تكن هناك مهام (كل المحافظ فشلت في الفحوصات السريعة)
-        if not tasks:
-            logging.info(f"⏭️ '{slug}': لا توجد محافظ مؤهلة للشراء.")
-            return
-
-        # تسجيل عدد المحاولات
-        logging.info(f"🔄 '{slug}': بدء {len(tasks)} محاولة شراء ({len(WALLETS)} محفظة × {len(ENABLED_CHAINS)} سلسلة)")
-
-        # --- تنفيذ جميع محاولات الشراء بالتوازي ---
-        # asyncio.gather تنفذ كل المهام في نفس الوقت
-        results = await asyncio.gather(*[t[4] for t in tasks], return_exceptions=True)
-
-        # معالجة النتائج لكل محفظة/سلسلة
-        for (wallet_name, chain_name, wallet_address, wallet_private_key, _), result in zip(tasks, results):
-            if isinstance(result, Exception):
-                # إذا كانت النتيجة خطأ غير متوقع
-                logging.error(f"❌ '{slug}' على {chain_name} - {wallet_name}: خطأ غير متوقع: {result}")
-                # جدولة إعادة المحاولة للخطأ غير المتوقع
-                async with retry_lock:
-                    retry_key = f"{slug}:{wallet_address}:{chain_name}"
-                    if retry_key not in retry_tasks:
-                        tracker = RetryTracker(
-                            slug=slug,
-                            wallet_address=wallet_address,
-                            chain_name=chain_name,
-                            detail=detail,
-                            wallet_name=wallet_name,
-                            wallet_private_key=wallet_private_key,
-                            price_wei=price_wei,
-                            max_per_wallet=max_per_wallet,
-                            remaining_supply=remaining,
-                            eth_price_usd=eth_price_usd,
-                            original_reason="tx_error",
-                        )
-                        retry_tasks[retry_key] = tracker
-                        asyncio.create_task(schedule_retry(session, tracker))
-                continue
-            
-            if isinstance(result, dict):
-                # إضافة سعر ETH للنتيجة (للرسالة)
-                result["eth_price_usd"] = eth_price_usd
-                
-                # إرسال إشعار تيليجرام بالنتيجة
-                enqueue_message(build_result_message(detail, result, chain_name, wallet_name))
-                
-                if result.get("success"):
-                    logging.info(f"✅ '{slug}' على {chain_name} - {wallet_name}: شراء ناجح - {result['quantity']} قطعة")
-                else:
-                    reason = result.get("reason", "غير معروف")
-                    logging.info(f"⏭️ '{slug}' على {chain_name} - {wallet_name}: {reason}")
-                    
-                    # --- جدولة إعادة المحاولة إذا كان السبب قابلاً لإعادة المحاولة ---
-                    if reason in RETRYABLE_REASONS:
-                        async with retry_lock:
-                            retry_key = f"{slug}:{wallet_address}:{chain_name}"
-                            if retry_key not in retry_tasks:
-                                tracker = RetryTracker(
-                                    slug=slug,
-                                    wallet_address=wallet_address,
-                                    chain_name=chain_name,
-                                    detail=detail,
-                                    wallet_name=wallet_name,
-                                    wallet_private_key=wallet_private_key,
-                                    price_wei=price_wei,
-                                    max_per_wallet=max_per_wallet,
-                                    remaining_supply=remaining,
-                                    eth_price_usd=eth_price_usd,
-                                    original_reason=reason,
-                                )
-                                retry_tasks[retry_key] = tracker
-                                asyncio.create_task(schedule_retry(session, tracker))
-                                logging.info(f"🔄 تمت جدولة إعادة المحاولة لـ '{slug}' - {wallet_name} على {chain_name} (السبب: {reason})")
-
+        
+        chain_display = CHAINS_CONFIG[chain_name]["chain_name_display"]
+        ready_wallets = sum(1 for w in WALLETS if is_wallet_balance_ok(w["address"], chain_name))
+        
+        log.info(f"🎁 '{slug}' على {chain_display}: {len(free_stages['active'])} نشطة | 👛 {ready_wallets}/{len(WALLETS)}")
+        
+        # ✅ إرسال تقرير الاكتشاف
+        report = build_free_mint_report(detail, chain_name, eth_price, free_stages)
+        send_telegram(report)
+        
+        async with CHECKING_LOCK:
+            NOTIFIED.add(slug)
+        
+        if has_active:
+            for stage in free_stages["active"]:
+                await process_stage_for_all_wallets(session, slug, detail, stage, chain_name)
+        
+        if has_upcoming:
+            for stage in free_stages["upcoming"]:
+                start_dt = stage.get("start_dt")
+                if start_dt:
+                    wait_seconds = max(0, (start_dt - datetime.now(timezone.utc)).total_seconds())
+                    if wait_seconds > 0:
+                        asyncio.create_task(wait_and_mint(session, slug, detail, stage, chain_name, start_dt))
+        
+        async with CHECKING_LOCK:
+            CHECKING.discard(slug)
+    
     except Exception as e:
-        logging.error(f"خطأ غير متوقع بمعالجة '{slug}': {e}")
-    finally:
-        # نزيل slug من قائمة المجموعات قيد الفحص (سواء نجحنا أو فشلنا)
-        checking.discard(slug)
+        log.error(f"❌ '{slug}': {e}\n{traceback.format_exc()}")
+        async with CHECKING_LOCK:
+            CHECKING.discard(slug)
 
 
-# ===================================================================
-# الاتصال بـ OpenSea Stream عبر WebSocket
-# ===================================================================
-# هذه الدالة تحافظ على اتصال WebSocket مع OpenSea لاستقبال
-# إشعارات فورية عند حصول مينت جديد
+async def wait_and_mint(session, slug, detail, stage, chain_name, start_time):
+    """انتظار مرحلة قادمة"""
+    wait_seconds = max(0, (start_time - datetime.now(timezone.utc)).total_seconds())
+    
+    if wait_seconds > 0:
+        stage_name = stage.get("stage", "مرحلة")
+        start_local = start_time.astimezone(LOCAL_TZ).strftime("%H:%M")
+        log.info(f"⏰ '{slug}' - {stage_name}: انتظار {wait_seconds/60:.1f} دقيقة")
+        
+        send_telegram(
+            f"⏰ <b>في الانتظار</b>\n"
+            f"📦 {detail.get('collection_name', slug)}\n"
+            f"🎯 {stage_name}\n"
+            f"🕐 يبدأ: {start_local}\n"
+            f"⏳ متبقي: {wait_seconds/60:.1f} دقيقة"
+        )
+        
+        await asyncio.sleep(wait_seconds + 2)
+    
+    found, updated = await fetch_drop_detail(session, slug)
+    detail_to_use = updated if found else detail
+    
+    log.info(f"🚀 '{slug}': بدء المرحلة القادمة!")
+    await process_stage_for_all_wallets(session, slug, detail_to_use, stage, chain_name)
 
-async def listen_opensea(notified: set, known_external: set, checking: set):
-    """
-    الاستماع إلى OpenSea Stream لرصد المينتات الجديدة.
-
-    هذه الدالة:
-    1. تتصل بـ WebSocket الخاص بـ OpenSea
-    2. تنضم إلى قناة collection:* (كل المجموعات)
-    3. تستقبل أحداث item_transferred
-    4. تكتشف المينتات الجديدة (من ZERO_ADDRESS)
-    5. ترسل slug للمعالجة
-
-    تعمل في حلقة لا نهائية مع إعادة اتصال تلقائي عند انقطاع الاتصال.
-
-    المعاملات:
-        notified: set - المجموعات التي تم إشعار المستخدم بها (مشترك مع الماسح)
-        known_external: set - المجموعات المعروفة/غير الصالحة (مشترك مع الماسح)
-        checking: set - المجموعات قيد الفحص (مشترك مع الماسح)
-    """
-    msg_ref = 0                       # عداد الرسائل
-
-    # جلسة HTTP مشتركة (تستخدمها كل الدوال)
+# ===========================================================================
+# ✅ مستمع WebSocket
+# ===========================================================================
+async def listen_opensea():
+    """الاستماع إلى OpenSea Stream"""
+    sem = asyncio.Semaphore(MAX_CONCURRENT)
+    event_cache: Dict[str, float] = {}
+    
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                # الاتصال بـ WebSocket
                 async with websockets.connect(STREAM_URL, ping_interval=None, open_timeout=15) as ws:
-                    logging.info("🚀 متصل بـ OpenSea Stream — Ethereum + Robinhood")
+                    log.info("🚀 متصل بـ OpenSea Stream")
+                    await ws.send(json.dumps(["1", "1", "collection:*", "phx_join", {}]))
                     
-                    # إرسال طلب الانضمام للقناة
-                    join_ref = str(msg_ref)
-                    await ws.send(json.dumps([join_ref, join_ref, "collection:*", "phx_join", {}]))
-                    msg_ref += 1
+                    last_hb = time.time()
                     
-                    # متغيرات تتبع الوقت
-                    last_heartbeat = time.time()      # آخر نبضة حياة
-                    last_stats_time = time.time()     # آخر إحصائيات
-
-                    # حلقة استقبال الرسائل
-                    while True:
-                        # إحصائيات دورية كل 5 دقائق
-                        if time.time() - last_stats_time > 300:
-                            actives = len(checking)
-                            retry_count = len(retry_tasks)
-                            logging.info(f"📊 إحصائيات: {len(notified)} معروف | {len(known_external)} خارجي | {actives} قيد الفحص | {retry_count} إعادة محاولة | {len(WALLETS)} محفظة")
-                            last_stats_time = time.time()
-
-                        # إرسال نبضات حياة للحفاظ على الاتصال
-                        if time.time() - last_heartbeat > HEARTBEAT_INTERVAL:
-                            hb_ref = str(msg_ref)
-                            await ws.send(json.dumps([None, hb_ref, "phoenix", "heartbeat", {}]))
-                            msg_ref += 1
-                            last_heartbeat = time.time()
-
-                        # استقبال رسالة (مع timeout)
-                        try:
-                            raw = await asyncio.wait_for(ws.recv(), timeout=RECV_TIMEOUT)
-                        except asyncio.TimeoutError:
-                            continue  # إذا انتهى الوقت دون رسالة، نستمر
-
-                        # تحليل JSON
+                    async for raw in ws:
+                        if time.time() - last_hb > HEARTBEAT_INTERVAL:
+                            await ws.send(json.dumps([None, "2", "phoenix", "heartbeat", {}]))
+                            last_hb = time.time()
+                        
                         try:
                             parsed = json.loads(raw)
-                        except json.JSONDecodeError:
-                            continue  # رسالة غير صالحة
-
-                        # تنسيق OpenSea: [join_ref, ref, topic, event, payload]
-                        if isinstance(parsed, list) and len(parsed) == 5:
-                            _jref, _ref, _topic, event_name, payload_wrapper = parsed
-                        else:
+                        except:
                             continue
-
-                        # نهتم فقط بأحداث item_transferred
-                        if event_name != "item_transferred":
+                        
+                        if not (isinstance(parsed, list) and len(parsed) == 5):
                             continue
-
-                        # استخراج الـ payload
-                        payload = (payload_wrapper or {}).get("payload") or {}
-                        item = payload.get("item", {}) or {}
-                        chain = (item.get("chain", {}) or {}).get("name", "")
-
-                        # نقبل Robinhood + Ethereum معًا (نتجاهل باقي السلاسل)
+                        
+                        _, _, _, event, pw = parsed
+                        if event != "item_transferred":
+                            continue
+                        
+                        payload = (pw or {}).get("payload", {})
+                        chain = ((payload.get("item", {})).get("chain", {}) or {}).get("name", "")
+                        
                         if chain not in ("robinhood", "ethereum"):
                             continue
-
-                        # التحقق من أن المرسل هو العقد (ZERO_ADDRESS) = مينت جديد
-                        from_address = ((payload.get("from_account") or {}).get("address", "") or "").lower()
-                        if from_address != ZERO_ADDRESS:
-                            continue  # ليس مينت جديد
-
-                        # استخراج slug المجموعة
+                        
                         slug = (payload.get("collection", {}) or {}).get("slug", "")
-                        
-                        # نتجاهل إذا:
-                        # - لا يوجد slug
-                        # - سبق وأشعرنا المستخدم بها
-                        # - معروفة كغير صالحة
-                        # - قيد الفحص حاليًا
-                        if not slug or slug in notified or slug in known_external or slug in checking:
+                        if not slug:
                             continue
-
-                        # إضافة slug إلى قائمة الفحص
-                        checking.add(slug)
-                        logging.info(f"🔍 اكتشاف جديد: '{slug}' على {chain}")
                         
-                        # إنشاء مهمة معالجة مع السيمافور (الحد من التزامن)
-                        asyncio.create_task(
-                            process_with_semaphore(session, slug, notified, known_external, checking)
-                        )
-
-            # معالجة أخطاء الاتصال وإعادة المحاولة
+                        now = time.time()
+                        if slug in event_cache and now - event_cache[slug] < EVENT_CACHE_TTL:
+                            continue
+                        event_cache[slug] = now
+                        
+                        for s in list(event_cache.keys()):
+                            if now - event_cache[s] > 60:
+                                del event_cache[s]
+                        
+                        async with CHECKING_LOCK:
+                            if slug in NOTIFIED or slug in CHECKING:
+                                continue
+                            CHECKING.add(slug)
+                        
+                        log.info(f"🔍 اكتشاف: '{slug}' على {chain}")
+                        
+                        async with sem:
+                            await handle_discovered_mint(session, slug, chain)
+            
             except (websockets.ConnectionClosed, OSError, asyncio.TimeoutError) as e:
-                logging.warning(f"⚠️ انقطع الاتصال ({e}). إعادة الاتصال خلال 3 ثوانٍ...")
-                await asyncio.sleep(3)
+                log.warning(f"⚠️ انقطع: {e}")
+                await asyncio.sleep(2)
             except Exception as e:
-                logging.error(f"خطأ غير متوقع: {e}. إعادة المحاولة خلال 5 ثوانٍ...")
-                await asyncio.sleep(5)
+                log.error(f"❌ {e}")
+                await asyncio.sleep(3)
 
-
-async def process_with_semaphore(
-    session: aiohttp.ClientSession,
-    slug: str,
-    notified: set,
-    known_external: set,
-    checking: set,
-):
-    """
-    معالجة مجموعة مع السيمافور للحد من التزامن.
+# ===========================================================================
+# ✅ الماسح الدوري
+# ===========================================================================
+async def scan_active_drops():
+    """مسح دوري"""
+    log.info(f"🔍 ماسح ذكي: كل {SCAN_INTERVAL} ثانية")
     
-    نستخدم Semaphore للتأكد من أننا لا نعالج أكثر من
-    MAX_CONCURRENT_MINTS مجموعة في نفس الوقت.
-    
-    المعاملات:
-        session: aiohttp.ClientSession - جلسة HTTP
-        slug: str - معرف المجموعة
-        notified: set - مجموعات تم إشعار المستخدم بها
-        known_external: set - مجموعات معروفة (غير صالحة)
-        checking: set - مجموعات قيد الفحص
-    """
-    async with semaphore:
-        await evaluate_and_buy(session, slug, notified, known_external, checking)
-
-
-# ===================================================================
-# الماسح الدوري للمينتات النشطة في السوق
-# ===================================================================
-
-async def scan_active_drops(notified: set, known_external: set, checking: set):
-    """
-    ماسح دوري يجلب كل المينتات النشطة حالياً في السوق من OpenSea.
-    يعمل كل SCAN_INTERVAL ثانية (افتراضياً 5 دقائق).
-
-    يكمل عمل listen_opensea بمعالجة المينتات الموجودة مسبقاً في السوق
-    وليس فقط المينتات الجديدة التي تُكتشف عبر WebSocket.
-
-    المعاملات:
-        notified: set - المجموعات التي تم إشعار المستخدم بها (مشترك مع المستمع)
-        known_external: set - المجموعات المعروفة/غير الصالحة (مشترك مع المستمع)
-        checking: set - المجموعات قيد الفحص (مشترك مع المستمع)
-    """
-    logging.info(f"🔍 الماسح الدوري: بدأ العمل — فحص كل {SCAN_INTERVAL // 60} دقائق")
-
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                # جلب قائمة المينتات النشطة حالياً من OpenSea
-                url = f"{DROPS_API_BASE}?is_minting=true&limit=50"
+                url = f"{DROPS_API_BASE}?is_minting=true&limit={DROPS_LIMIT}"
                 headers = {"x-api-key": OPENSEA_API_KEY}
-
-                async with session.get(
-                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
-                ) as resp:
-                    if resp.status != 200:
-                        logging.warning(f"[الماسح] OpenSea رد بـ HTTP {resp.status}")
-                    else:
+                
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
                         data = await resp.json()
-                        # OpenSea قد يستخدم 'drops' أو 'results' كاسم للقائمة
                         drops = data.get("drops") or data.get("results", [])
-                        logging.info(f"[الماسح] وجد {len(drops)} مينت نشط في السوق")
-
-                        new_count = 0
+                        
                         for drop in drops:
-                            # slug قد يكون في 'collection_slug' أو 'slug'
                             slug = drop.get("collection_slug") or drop.get("slug", "")
                             if not slug:
                                 continue
-                            # تجاهل المعروفة والمعالجة حالياً
-                            if slug in notified or slug in known_external or slug in checking:
+                            
+                            async with CHECKING_LOCK:
+                                if slug in NOTIFIED or slug in CHECKING:
+                                    continue
+                            
+                            chain = drop.get("chain") or "ethereum"
+                            if isinstance(chain, dict):
+                                chain = chain.get("name", "ethereum")
+                            
+                            if chain not in ENABLED_CHAINS:
                                 continue
-                            checking.add(slug)
-                            new_count += 1
-                            logging.info(f"🔍 [الماسح] اكتشاف: '{slug}'")
-                            asyncio.create_task(
-                                process_with_semaphore(session, slug, notified, known_external, checking)
-                            )
-
-                        if new_count > 0:
-                            logging.info(f"[الماسح] أرسل {new_count} مينت جديد للمعالجة")
-
+                            
+                            await smart_scanner.add_slug(slug)
+                        
+                        await smart_scanner.process_batch(session)
+                        
             except Exception as e:
-                logging.error(f"[الماسح] خطأ أثناء المسح: {e}")
-
-            # انتظار حتى الجولة التالية
+                log.error(f"[ماسح] {e}")
+            
             await asyncio.sleep(SCAN_INTERVAL)
 
-
-# ===================================================================
-# التشغيل الرئيسي
-# ===================================================================
-# هذه الدالة تبدأ تشغيل النظام بالكامل
-
-async def run():
-    """
-    تشغيل النظام: بدء الاستماع لـ OpenSea + مرسل تيليجرام.
+# ===========================================================================
+# ✅ تنظيف دوري
+# ===========================================================================
+async def cleanup_task():
+    """تنظيف دوري"""
+    log.info("🧹 بدء مهمة التنظيف")
     
-    إذا كان BOT_ENABLED = false، لن يتم شراء أي شيء (وضع الأمان).
-    """
-    if not BOT_ENABLED:
-        logging.warning("🔴 BOT_ENABLED=false — النظام متوقف عمدًا (وضع الأمان). لن يشتري أي شي.")
-        enqueue_message("🔴 البوت شغّال لكن بوضع الإيقاف (BOT_ENABLED=false) — ما رح يشتري لين تفعّله.")
-        await telegram_sender()  # نرسل رسالة الإيقاف فقط
-        return
+    while True:
+        try:
+            drop_cache.clear()
+            
+            async with CHECKING_LOCK:
+                if len(NOTIFIED) > 1000:
+                    NOTIFIED.clear()
+                    log.info("🧹 تم تنظيف NOTIFIED")
+            
+            # تقرير دوري عن حالة النظام
+            log.info(f"📊 الحالة: NOTIFIED={len(NOTIFIED)}, CHECKING={len(CHECKING)}, "
+                    f"إعادة المحاولة={len(retry_tasks)}, "
+                    f"رسائل مرسلة={sent_count}, فشلت={failed_count}")
+            
+        except Exception as e:
+            log.error(f"[تنظيف] {e}")
+        
+        await asyncio.sleep(3600)
 
-    if not WALLETS:
-        logging.critical("🔴 لا توجد محافظ! تأكد من تعبئة PRIVATE_KEY و WALLET_ADDRESS في ملف .env")
-        enqueue_message("🔴 لا توجد محافظ! تأكد من تعبئة PRIVATE_KEY و WALLET_ADDRESS في ملف .env")
+# ===========================================================================
+# ✅ التشغيل الرئيسي
+# ===========================================================================
+async def run():
+    """تشغيل النظام"""
+    if not BOT_ENABLED:
+        log.warning("🔴 BOT_ENABLED=false")
+        send_telegram("🔴 <b>البوت متوقف</b>")
         await telegram_sender()
         return
-
-    # بناء تقرير حالة السلاسل والمحافظ
-    chains_status = []
-    for c in ENABLED_CHAINS:
-        chains_status.append(CHAINS_CONFIG[c]["chain_name_display"])
     
-    wallets_count = len(WALLETS)
-    status_msg = "✅ نظام الشراء التلقائي v2 اشتغل الآن!\n"
-    status_msg += f"📡 السلاسل النشطة: {', '.join(chains_status) if chains_status else 'لا توجد'}\n"
-    status_msg += f"👛 المحافظ النشطة: {wallets_count}\n"
-    status_msg += f"🔢 الحد الأقصى للمجموعات المتزامنة: {MAX_CONCURRENT_MINTS}\n"
-    status_msg += f"🔄 نظام إعادة المحاولة: نشط — يحاول كل ساعة لمدة {MAX_RETRY_HOURS} ساعات\n"
-    status_msg += f"🔍 الماسح الدوري: نشط — يفحص المينتات كل {SCAN_INTERVAL // 60} دقائق"
-
-    # إرسال رسالة بدء التشغيل عبر تيليجرام
-    enqueue_message(status_msg)
-    logging.info(status_msg)
-
-    # مجموعات مشتركة بين الماسح والمستمع (لمنع معالجة نفس المينت مرتين)
-    notified: set[str] = set()        # المجموعات التي تم إشعار المستخدم بها
-    known_external: set[str] = set()  # المجموعات المعروفة (غير صالحة)
-    checking: set[str] = set()        # المجموعات قيد الفحص حاليًا
-
-    # تشغيل ثلاث مهام بالتوازي:
-    # 1. الاستماع لـ OpenSea Stream (مينتات جديدة فورية)
-    # 2. الماسح الدوري (مينتات موجودة في السوق كل 5 دقائق)
-    # 3. إرسال رسائل تيليجرام
+    if not WALLETS:
+        log.critical("🔴 لا توجد محافظ!")
+        send_telegram("🔴 <b>لا توجد محافظ!</b>")
+        await telegram_sender()
+        return
+    
+    if not ENABLED_CHAINS:
+        log.critical("🔴 لا توجد سلاسل!")
+        send_telegram("🔴 <b>لا توجد سلاسل!</b>")
+        await telegram_sender()
+        return
+    
+    # تهيئة هياكل البيانات
+    for chain_name in ENABLED_CHAINS:
+        LOW_BALANCE_BY_CHAIN[chain_name] = set()
+    
+    chains_list = "\n".join([f"  • {CHAINS_CONFIG[c]['chain_name_display']}" for c in ENABLED_CHAINS])
+    
+    # ✅ رسالة بدء التشغيل
+    status_msg = (
+        f"✅ <b>بدء النظام</b>\n\n"
+        f"📡 <b>السلاسل:</b>\n{chains_list}\n"
+        f"👛 <b>المحافظ:</b> {len(WALLETS)}\n"
+        f"🔥 <b>الشراء:</b> جميع المحافظ (متوازي)\n"
+        f"🎯 <b>النوع:</b> مجاني فقط\n"
+        f"💰 <b>الرصيد الأدنى:</b> ${MIN_BALANCE_RESERVE_USD}\n"
+        f"🔍 <b>فحص الرصيد:</b> لكل سلسلة على حدة\n"
+        f"⚠️ <b>الرصيد المنخفض:</b> يوقف السلسلة المنخفضة فقط\n"
+        f"⛽ <b>أقصى غاز:</b> ${MAX_GAS_FEE_USD}"
+    )
+    
+    send_telegram(status_msg)
+    log.info("🚀 بدء التشغيل...")
+    
+    # اختبار تيليجرام
+    test_telegram()
+    
     await asyncio.gather(
-        listen_opensea(notified, known_external, checking),
-        scan_active_drops(notified, known_external, checking),
+        listen_opensea(),
+        scan_active_drops(),
+        balance_monitor(),
+        cleanup_task(),
         telegram_sender(),
     )
 
 
 def main():
-    """
-    نقطة الدخول الرئيسية للتطبيق.
+    """نقطة الدخول"""
+    # ✅ تحقق من ملف .env أولاً
+    verify_env_file()
     
-    تحتوي على حلقة إعادة تشغيل تلقائية مع:
-    - تأخير تصاعدي (backoff) يبدأ من 2 ثانية ويصل إلى 30 ثانية
-    - معالجة Ctrl+C للإيقاف اليدوي
-    """
-    backoff = 2  # وقت الانتظار الأولي قبل إعادة التشغيل (ثوانٍ)
+    # ✅ طباعة حالة المتغيرات
+    print_env_status()
     
+    if not BOT_ENABLED:
+        log.warning("🔴 BOT_ENABLED=false - البوت متوقف")
+        return
+    
+    # ✅ التحقق من وجود محافظ
+    if not WALLETS:
+        log.error("🔴 لا توجد محافظ - تحقق من ملف .env")
+        return
+    
+    # ✅ التحقق من وجود سلاسل
+    eth_url = os.environ.get("ETHEREUM_RPC_URL", "").strip()
+    rob_url = os.environ.get("ROBINHOOD_RPC_URL", "").strip()
+    
+    if not eth_url and not rob_url:
+        log.error("🔴 لا توجد RPC URLs - تحقق من ملف .env")
+        return
+    
+    backoff = 2
     while True:
         try:
-            asyncio.run(run())  # تشغيل النظام غير المتزامن
+            asyncio.run(run())
         except KeyboardInterrupt:
-            # إيقاف يدوي بـ Ctrl+C
-            logging.info("تم الإيقاف يدويًا.")
+            log.info("👋 تم الإيقاف يدوياً")
             break
         except Exception as e:
-            # خطأ غير متوقع: إعادة تشغيل تلقائي
-            logging.critical(f"توقف غير متوقع: {e}. إعادة التشغيل خلال {backoff} ثانية...")
+            log.critical(f"💥 توقف: {e}\n{traceback.format_exc()}")
             time.sleep(backoff)
-            backoff = min(backoff * 2, 30)  # مضاعفة وقت الانتظار (حد أقصى 30 ثانية)
-            continue
-        else:
-            break  # خروج عادي من الحلقة
+            backoff = min(backoff * 2, 30)
 
 
-# نقطة البداية - عند تشغيل python main.py
 if __name__ == "__main__":
     main()
