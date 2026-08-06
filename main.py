@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+import traceback
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 
@@ -33,10 +34,17 @@ load_dotenv()
 # ===================================================================
 # المتغيرات العامة
 # ===================================================================
-OPENSEA_API_KEY = os.environ["OPENSEA_API_KEY"].strip()
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
-BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").strip().lower() == "true"
+OPENSEA_API_KEY = os.environ.get("OPENSEA_API_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+BOT_ENABLED = os.environ.get("BOT_ENABLED", "true").strip().lower() == "true"
+
+# ===================================================================
+# التحقق من صحة متغيرات تيليجرام
+# ===================================================================
+if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    logging.warning("⚠️ متغيرات تيليجرام غير مكتملة! لن يتم إرسال الإشعارات.")
+    BOT_ENABLED = False
 
 # ===================================================================
 # إعداد المحافظ المتعددة
@@ -184,32 +192,23 @@ semaphore = asyncio.Semaphore(MAX_CONCURRENT_MINTS)
 # تحديد السلسلة الصحيحة للمجموعة
 # ===================================================================
 def determine_actual_chain(slug: str, stream_chain: str, contract_address: str) -> str:
-    """
-    تحديد السلسلة الصحيحة للمجموعة بناءً على معلومات متعددة.
-    """
+    """تحديد السلسلة الصحيحة للمجموعة بناءً على معلومات متعددة."""
     stream_chain = stream_chain.lower() if stream_chain else ""
     slug_lower = slug.lower() if slug else ""
     contract_address = contract_address.lower() if contract_address else ""
     
-    # 1. التحقق من الـ slug
     if "robinhood" in slug_lower or "rh" in slug_lower or "hood" in slug_lower:
-        logging.debug(f"🔍 '{slug}' → Robinhood (من slug)")
         return "robinhood"
     
-    # 2. التحقق من عنوان العقد (Robinhood Chain)
     if contract_address.startswith("0x00005ea00a"):
-        logging.debug(f"🔍 '{slug}' → Robinhood (من عنوان العقد)")
         return "robinhood"
     
-    # 3. إذا كانت السلسلة من Stream هي Robinhood
     if stream_chain == "robinhood":
         return "robinhood"
     
-    # 4. إذا كانت السلسلة من Stream هي ethereum
     if stream_chain == "ethereum":
         return "ethereum"
     
-    # 5. افتراضياً: نبحث في السلاسل المتاحة
     if "ethereum" in ENABLED_CHAINS:
         return "ethereum"
     elif "robinhood" in ENABLED_CHAINS:
@@ -277,35 +276,92 @@ def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
     return price_usd < FREE_PRICE_THRESHOLD_USD
 
 # ===================================================================
-# نظام إشعارات تيليجرام
+# نظام إشعارات تيليجرام - مُحسّن
 # ===================================================================
 send_queue: asyncio.Queue[str] = asyncio.Queue()
 
 def enqueue_message(text: str):
+    """إضافة رسالة إلى طابور الإرسال مع تسجيل للتصحيح."""
+    if not BOT_ENABLED:
+        logging.info(f"📝 [TELEGRAM DISABLED] {text[:200]}...")
+        return
+    
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("⚠️ متغيرات تيليجرام غير مكتملة، لا يمكن إرسال الرسالة")
+        return
+    
+    logging.info(f"📤 إضافة رسالة إلى الطابور: {text[:100]}...")
     send_queue.put_nowait(text)
 
+async def send_telegram_message(session: aiohttp.ClientSession, text: str) -> bool:
+    """إرسال رسالة واحدة إلى تيليجرام."""
+    if not BOT_ENABLED:
+        return False
+    
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.error("❌ متغيرات تيليجرام غير مكتملة")
+        return False
+    
+    try:
+        # تقسيم الرسائل الطويلة
+        if len(text) > 4000:
+            parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
+            for part in parts:
+                await send_telegram_message(session, part)
+            return True
+        
+        url = f"{TELEGRAM_API}/sendMessage"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+        }
+        
+        async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            response_text = await resp.text()
+            if resp.status == 200:
+                logging.info("✅ تم إرسال رسالة تيليجرام بنجاح")
+                return True
+            else:
+                logging.error(f"❌ فشل إرسال تيليجرام: HTTP {resp.status} - {response_text[:200]}")
+                return False
+    except asyncio.TimeoutError:
+        logging.error("❌ تيليجرام: timeout")
+        return False
+    except Exception as e:
+        logging.error(f"❌ تيليجرام: خطأ غير متوقع: {e}")
+        return False
+
 async def telegram_sender():
+    """إرسال الرسائل من الطابور إلى تيليجرام بشكل غير متزامن."""
     async with aiohttp.ClientSession() as session:
         while True:
-            text = await send_queue.get()
-            
             try:
-                async with session.post(
-                    f"{TELEGRAM_API}/sendMessage",
-                    data={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "text": text,
-                        "parse_mode": "HTML",
-                    },
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as resp:
-                    if resp.status != 200:
-                        logging.warning(f"تيليجرام: استجابة غير متوقعة {resp.status}")
+                # انتظار رسالة جديدة في الطابور
+                text = await send_queue.get()
+                
+                # محاولة إرسال الرسالة مع إعادة محاولة
+                success = False
+                for attempt in range(3):
+                    success = await send_telegram_message(session, text)
+                    if success:
+                        break
+                    if attempt < 2:
+                        logging.warning(f"🔄 إعادة محاولة إرسال تيليجرام {attempt + 2}/3 بعد 2 ثانية")
+                        await asyncio.sleep(2)
+                
+                if not success:
+                    logging.error(f"❌ فشل إرسال رسالة تيليجرام بعد 3 محاولات")
+                    
+            except asyncio.CancelledError:
+                logging.info("🛑 تم إيقاف مرسل تيليجرام")
+                break
             except Exception as e:
-                logging.error(f"خطأ إرسال تليجرام: {e}")
-            
-            send_queue.task_done()
-            await asyncio.sleep(1.05)
+                logging.error(f"❌ خطأ في telegram_sender: {e}")
+                logging.error(traceback.format_exc())
+            finally:
+                send_queue.task_done()
+                await asyncio.sleep(1.0)  # تأخير بين الرسائل
 
 # ===================================================================
 # رسائل أسباب الفشل
@@ -354,7 +410,7 @@ def check_user_eligibility(reason: str, balance_usd: float = 0, gas_fee_usd: flo
     }
 
 def build_result_message(detail: dict, result: dict, chain_name: str, wallet_name: str = "المحفظة") -> str:
-    name = detail.get("collection_name") or detail.get("collection_slug")
+    name = detail.get("collection_name") or detail.get("collection_slug", "غير معروف")
     url = detail.get("opensea_url", "")
     chain_display = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
     
@@ -362,15 +418,15 @@ def build_result_message(detail: dict, result: dict, chain_name: str, wallet_nam
     price_wei = int(stage.get("price", "0"))
     eth_price_usd = result.get("eth_price_usd", 0)
 
-    if result["success"]:
+    if result.get("success", False):
         return (
             f"✅ <b>تم الشراء بنجاح!</b>\n\n"
-            f"المجموعة: <b>{name}</b>\n"
-            f"السلسلة: {chain_display}\n"
-            f"المحفظة: {wallet_name}\n"
-            f"الكمية: {result['quantity']}\n"
-            f"رسوم الغاز: ${result['gas_fee_usd']:.4f}\n"
-            f"معاملة: {result['tx_hash']}\n"
+            f"📦 المجموعة: <b>{name}</b>\n"
+            f"⛓️ السلسلة: {chain_display}\n"
+            f"👛 المحفظة: {wallet_name}\n"
+            f"📊 الكمية: {result.get('quantity', 0)}\n"
+            f"⛽ رسوم الغاز: ${result.get('gas_fee_usd', 0):.4f}\n"
+            f"🔗 معاملة: {result.get('tx_hash', '')}\n"
             f"🔗 {url}"
         )
 
@@ -386,18 +442,18 @@ def build_result_message(detail: dict, result: dict, chain_name: str, wallet_nam
     
     extra = ""
     if result.get("balance_usd"):
-        extra += f"\nالرصيد الحالي: ${result['balance_usd']:.4f}"
+        extra += f"\n💵 الرصيد الحالي: ${result['balance_usd']:.4f}"
     if result.get("gas_fee_usd"):
-        extra += f"\nالرسوم المقدّرة: ${result['gas_fee_usd']:.4f}"
+        extra += f"\n⛽ الرسوم المقدّرة: ${result['gas_fee_usd']:.4f}"
     if result.get("tx_hash"):
-        extra += f"\nهاش المعاملة: {result['tx_hash']}"
+        extra += f"\n🔗 هاش المعاملة: {result['tx_hash']}"
 
     return (
         f"⏭️ <b>تم تجاهل الشراء</b>\n\n"
-        f"المجموعة: <b>{name}</b>\n"
-        f"السلسلة: {chain_display}\n"
-        f"المحفظة: {wallet_name}\n"
-        f"السبب: {reason_text}{extra}\n\n"
+        f"📦 المجموعة: <b>{name}</b>\n"
+        f"⛓️ السلسلة: {chain_display}\n"
+        f"👛 المحفظة: {wallet_name}\n"
+        f"⚠️ السبب: {reason_text}{extra}\n\n"
         f"─── ℹ️ معلومات التحليل ───\n"
         f"{mint_info['icon']} نوع المينت: {mint_info['mint_type']}\n"
         f"{eligibility['icon']} الأهلية: {eligibility['label']}\n"
@@ -521,7 +577,10 @@ async def retry_purchase(session: aiohttp.ClientSession, tracker: RetryTracker):
         eth_price_usd,
     )
     result["eth_price_usd"] = eth_price_usd
-    enqueue_message(build_result_message(detail, result, tracker.chain_name, tracker.wallet_name))
+    
+    # إرسال إشعار
+    msg = build_result_message(detail, result, tracker.chain_name, tracker.wallet_name)
+    enqueue_message(msg)
 
     if result.get("success"):
         async with retry_lock:
@@ -558,14 +617,15 @@ async def schedule_retry(session: aiohttp.ClientSession, tracker: RetryTracker):
 
         tracker.attempt_count += 1
         if "gas" not in reason or tracker.attempt_count % 10 == 0:
-            enqueue_message(
+            msg = (
                 f"🔄 <b>إعادة محاولة مستمرة</b>\n\n"
-                f"المجموعة: <b>{tracker.slug}</b>\n"
-                f"السلسلة: {tracker.chain_name}\n"
-                f"السبب: {tracker.original_reason}\n"
-                f"المحاولة: {tracker.attempt_count}\n"
-                f"الوقت المتبقي: {tracker.hours_remaining:.1f} ساعة"
+                f"📦 المجموعة: <b>{tracker.slug}</b>\n"
+                f"⛓️ السلسلة: {tracker.chain_name}\n"
+                f"⚠️ السبب: {tracker.original_reason}\n"
+                f"📊 المحاولة: {tracker.attempt_count}\n"
+                f"⏳ الوقت المتبقي: {tracker.hours_remaining:.1f} ساعة"
             )
+            enqueue_message(msg)
         
         await retry_purchase(session, tracker)
         
@@ -575,14 +635,15 @@ async def schedule_retry(session: aiohttp.ClientSession, tracker: RetryTracker):
 
     async with retry_lock:
         if tracker.retry_key in retry_tasks:
-            enqueue_message(
+            msg = (
                 f"⏰ <b>انتهت محاولات إعادة الشراء</b>\n\n"
-                f"المجموعة: <b>{tracker.slug}</b>\n"
-                f"السلسلة: {tracker.chain_name}\n"
-                f"المحفظة: {tracker.wallet_name}\n"
-                f"عدد المحاولات: {tracker.attempt_count}\n"
-                f"المدة: {MAX_RETRY_HOURS} ساعات"
+                f"📦 المجموعة: <b>{tracker.slug}</b>\n"
+                f"⛓️ السلسلة: {tracker.chain_name}\n"
+                f"👛 المحفظة: {tracker.wallet_name}\n"
+                f"📊 عدد المحاولات: {tracker.attempt_count}\n"
+                f"⏳ المدة: {MAX_RETRY_HOURS} ساعات"
             )
+            enqueue_message(msg)
             retry_tasks.pop(tracker.retry_key, None)
 
 # ===================================================================
@@ -622,17 +683,16 @@ async def evaluate_and_buy(
         price_wei = int(stage.get("price", "0") or "0")
         eth_price_usd = await get_eth_price_usd(session)
 
-        # تحديد السلسلة الصحيحة
         contract_address = detail.get("contract_address", "")
         stream_chain = detail.get("chain", "ethereum")
         actual_chain = determine_actual_chain(slug, stream_chain, contract_address)
         
-        # التحقق من أن السلسلة مدعومة
         if actual_chain not in ENABLED_CHAINS:
             logging.info(f"⏭️ '{slug}': السلسلة {actual_chain} غير مدعومة.")
             known_external.add(slug)
             return
 
+        # إرسال معلومات المينت
         info_msg = build_mint_info_message(detail, eth_price_usd, actual_chain)
         enqueue_message(info_msg)
 
@@ -658,7 +718,6 @@ async def evaluate_and_buy(
             enqueue_message(f"⚠️ لا توجد محافظ مفعلة للمجموعة {slug}")
             return
 
-        # نستخدم فقط السلسلة المحددة للمجموعة
         tasks = []
         w3 = w3_instances.get(actual_chain)
         if not w3:
@@ -689,7 +748,10 @@ async def evaluate_and_buy(
                     "eth_price_usd": eth_price_usd,
                     "chain": actual_chain,
                 }
-                enqueue_message(build_result_message(detail, result, actual_chain, wallet_name))
+                
+                # إرسال إشعار الفشل
+                msg = build_result_message(detail, result, actual_chain, wallet_name)
+                enqueue_message(msg)
                 
                 if reason in RETRYABLE_REASONS:
                     async with retry_lock:
@@ -756,7 +818,8 @@ async def evaluate_and_buy(
             
             if isinstance(result, dict):
                 result["eth_price_usd"] = eth_price_usd
-                enqueue_message(build_result_message(detail, result, chain_name, wallet_name))
+                msg = build_result_message(detail, result, chain_name, wallet_name)
+                enqueue_message(msg)
                 
                 if result.get("success"):
                     logging.info(f"✅ '{slug}' على {chain_name} - {wallet_name}: شراء ناجح - {result['quantity']} قطعة")
@@ -787,6 +850,7 @@ async def evaluate_and_buy(
 
     except Exception as e:
         logging.error(f"خطأ غير متوقع بمعالجة '{slug}': {e}")
+        logging.error(traceback.format_exc())
     finally:
         checking.discard(slug)
 
@@ -843,12 +907,10 @@ async def listen_opensea(notified: set, known_external: set, checking: set):
                         payload = (payload_wrapper or {}).get("payload") or {}
                         item = payload.get("item", {}) or {}
                         
-                        # معلومات السلسلة من Stream
                         chain = (item.get("chain", {}) or {}).get("name", "").lower()
                         slug = (payload.get("collection", {}) or {}).get("slug", "")
                         contract_address = (item.get("contract", {}) or {}).get("address", "")
                         
-                        # تحديد السلسلة الصحيحة
                         actual_chain = determine_actual_chain(slug, chain, contract_address)
                         
                         if actual_chain not in ENABLED_CHAINS:
@@ -874,6 +936,7 @@ async def listen_opensea(notified: set, known_external: set, checking: set):
                 await asyncio.sleep(3)
             except Exception as e:
                 logging.error(f"خطأ غير متوقع: {e}. إعادة المحاولة خلال 5 ثوانٍ...")
+                logging.error(traceback.format_exc())
                 await asyncio.sleep(5)
 
 async def process_with_semaphore(
@@ -898,8 +961,8 @@ async def scan_active_drops(notified: set, known_external: set, checking: set):
             try:
                 all_drops = []
                 
-                # جلب المينتات من Robinhood Chain
-                if "robinhood" in ENABLED_CHAINS:
+                # جلب المينتات من كلتا السلسلتين
+                for chain_name in ENABLED_CHAINS:
                     url = f"{DROPS_API_BASE}?is_minting=true&limit=50"
                     headers = {"x-api-key": OPENSEA_API_KEY}
                     try:
@@ -910,32 +973,12 @@ async def scan_active_drops(notified: set, known_external: set, checking: set):
                                 for drop in drops:
                                     slug = drop.get("collection_slug") or drop.get("slug", "")
                                     contract = drop.get("contract_address", "")
-                                    # تحديد السلسلة
-                                    chain = determine_actual_chain(slug, "robinhood", contract)
-                                    if chain == "robinhood":
-                                        drop["_chain"] = "robinhood"
+                                    chain = determine_actual_chain(slug, chain_name, contract)
+                                    if chain == chain_name:
+                                        drop["_chain"] = chain_name
                                         all_drops.append(drop)
                     except Exception as e:
-                        logging.warning(f"[الماسح] Robinhood API خطأ: {e}")
-                
-                # جلب المينتات من Ethereum Mainnet
-                if "ethereum" in ENABLED_CHAINS:
-                    url = f"{DROPS_API_BASE}?is_minting=true&limit=50"
-                    headers = {"x-api-key": OPENSEA_API_KEY}
-                    try:
-                        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                            if resp.status == 200:
-                                data = await resp.json()
-                                drops = data.get("drops") or data.get("results", [])
-                                for drop in drops:
-                                    slug = drop.get("collection_slug") or drop.get("slug", "")
-                                    contract = drop.get("contract_address", "")
-                                    chain = determine_actual_chain(slug, "ethereum", contract)
-                                    if chain == "ethereum":
-                                        drop["_chain"] = "ethereum"
-                                        all_drops.append(drop)
-                    except Exception as e:
-                        logging.warning(f"[الماسح] Ethereum API خطأ: {e}")
+                        logging.warning(f"[الماسح] {chain_name} API خطأ: {e}")
                 
                 logging.info(f"[الماسح] وجد {len(all_drops)} مينت نشط في السوق")
 
@@ -961,6 +1004,7 @@ async def scan_active_drops(notified: set, known_external: set, checking: set):
 
             except Exception as e:
                 logging.error(f"[الماسح] خطأ أثناء المسح: {e}")
+                logging.error(traceback.format_exc())
 
             await asyncio.sleep(SCAN_INTERVAL)
 
@@ -968,6 +1012,17 @@ async def scan_active_drops(notified: set, known_external: set, checking: set):
 # التشغيل الرئيسي
 # ===================================================================
 async def run():
+    # إرسال رسالة بدء التشغيل
+    startup_msg = "🚀 <b>نظام الشراء التلقائي يعمل الآن!</b>\n\n"
+    startup_msg += f"📡 السلاسل النشطة: {', '.join([CHAINS_CONFIG[c]['chain_name_display'] for c in ENABLED_CHAINS]) if ENABLED_CHAINS else 'لا توجد'}\n"
+    startup_msg += f"👛 المحافظ النشطة: {len(WALLETS)}\n"
+    startup_msg += f"🔢 الحد الأقصى للمجموعات المتزامنة: {MAX_CONCURRENT_MINTS}\n"
+    startup_msg += f"🔄 نظام إعادة المحاولة: نشط لمدة {MAX_RETRY_HOURS} ساعات\n"
+    startup_msg += f"💡 الرصيد يُفحص لكل سلسلة بشكل منفصل"
+    
+    enqueue_message(startup_msg)
+    logging.info("🚀 بدء تشغيل النظام...")
+
     if not BOT_ENABLED:
         logging.warning("🔴 BOT_ENABLED=false — النظام متوقف عمدًا (وضع الأمان).")
         enqueue_message("🔴 البوت شغّال لكن بوضع الإيقاف (BOT_ENABLED=false)")
@@ -980,25 +1035,15 @@ async def run():
         await telegram_sender()
         return
 
-    chains_status = []
-    for c in ENABLED_CHAINS:
-        chains_status.append(CHAINS_CONFIG[c]["chain_name_display"])
-    
-    status_msg = "✅ نظام الشراء التلقائي v2 اشتغل الآن!\n"
-    status_msg += f"📡 السلاسل النشطة: {', '.join(chains_status) if chains_status else 'لا توجد'}\n"
-    status_msg += f"👛 المحافظ النشطة: {len(WALLETS)}\n"
-    status_msg += f"🔢 الحد الأقصى للمجموعات المتزامنة: {MAX_CONCURRENT_MINTS}\n"
-    status_msg += f"🔄 نظام إعادة المحاولة: نشط — محاولات مستمرة وذكية لمدة {MAX_RETRY_HOURS} ساعات\n"
-    status_msg += f"🔍 الماسح الدوري: نشط — يفحص المينتات كل {SCAN_INTERVAL} ثانية"
-    status_msg += f"\n💡 الرصيد يُفحص لكل سلسلة بشكل منفصل"
-
-    enqueue_message(status_msg)
-    logging.info(status_msg)
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.warning("⚠️ متغيرات تيليجرام غير مكتملة! لن يتم إرسال الإشعارات.")
+        enqueue_message("⚠️ متغيرات تيليجرام غير مكتملة! لن يتم إرسال الإشعارات.")
 
     notified: set[str] = set()
     known_external: set[str] = set()
     checking: set[str] = set()
 
+    # تشغيل المهام
     await asyncio.gather(
         listen_opensea(notified, known_external, checking),
         scan_active_drops(notified, known_external, checking),
@@ -1016,6 +1061,7 @@ def main():
             break
         except Exception as e:
             logging.critical(f"توقف غير متوقع: {e}. إعادة التشغيل خلال {backoff} ثانية...")
+            logging.error(traceback.format_exc())
             time.sleep(backoff)
             backoff = min(backoff * 2, 30)
             continue
