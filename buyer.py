@@ -31,7 +31,6 @@ except ImportError:
 # ===========================================================================
 # إعدادات فحص الرصيد - لكل سلسلة على حدة
 # ===========================================================================
-# نقوم بتخزين الرصيد لكل (محفظة + سلسلة) بشكل منفصل
 _balance_cache = {}  # المفتاح: f"{wallet_address}:{chain_name}"
 _balance_cache_lock = threading.Lock()
 
@@ -138,22 +137,13 @@ def get_balance_cache_key(wallet_address: str, chain_name: str) -> str:
 def get_wallet_balance_usd(w3: Web3, wallet_address: str, chain_name: str, eth_price_usd: float) -> float:
     """
     يرجع رصيد المحفظة بالدولار - لكل سلسلة بشكل منفصل.
-    
-    المعاملات:
-        w3: Web3 - كائن Web3 للسلسلة المطلوبة
-        wallet_address: str - عنوان المحفظة
-        chain_name: str - اسم السلسلة (ethereum أو robinhood)
-        eth_price_usd: float - سعر ETH الحالي
-    
-    المخرجات:
-        float - الرصيد بالدولار
     """
     now = time.time()
     checksum_address = Web3.to_checksum_address(wallet_address)
     cache_key = get_balance_cache_key(wallet_address, chain_name)
     
     # =============================================================
-    # 1. فحص التخزين المؤقت أولاً (لكل سلسلة على حدة)
+    # 1. فحص التخزين المؤقت أولاً
     # =============================================================
     with _balance_cache_lock:
         if cache_key in _balance_cache:
@@ -170,7 +160,6 @@ def get_wallet_balance_usd(w3: Web3, wallet_address: str, chain_name: str, eth_p
             balance_wei = w3.eth.get_balance(checksum_address)
             balance_usd = (balance_wei / 1e18) * eth_price_usd
             
-            # تخزين النتيجة مع السلسلة
             with _balance_cache_lock:
                 _balance_cache[cache_key] = (now, balance_usd)
             
@@ -192,7 +181,7 @@ def get_wallet_balance_usd(w3: Web3, wallet_address: str, chain_name: str, eth_p
                 break
     
     # =============================================================
-    # 3. إذا فشلت كل المحاولات، استخدم آخر قيمة معروفة لهذه السلسلة
+    # 3. إذا فشلت كل المحاولات، استخدم آخر قيمة معروفة
     # =============================================================
     with _balance_cache_lock:
         if cache_key in _balance_cache:
@@ -201,6 +190,37 @@ def get_wallet_balance_usd(w3: Web3, wallet_address: str, chain_name: str, eth_p
     
     log.error(f"❌ [FALLBACK] {chain_name} - تعذر الحصول على رصيد {wallet_address[:8]}...، استخدم 0.0")
     return 0.0
+
+
+def get_all_wallets_balances(w3_instances: dict, wallets: list, eth_price_usd: float) -> dict:
+    """
+    جلب رصيد جميع المحافظ على جميع السلاسل.
+    
+    المعاملات:
+        w3_instances: dict - قاموس كائنات Web3 لكل سلسلة
+        wallets: list - قائمة المحافظ
+        eth_price_usd: float - سعر ETH الحالي
+    
+    المخرجات:
+        dict: {
+            "wallet_name": {
+                "ethereum": 0.123,
+                "robinhood": 0.456
+            }
+        }
+    """
+    balances = {}
+    
+    for wallet in wallets:
+        wallet_name = wallet["name"]
+        wallet_address = wallet["address"]
+        balances[wallet_name] = {}
+        
+        for chain_name, w3 in w3_instances.items():
+            balance = get_wallet_balance_usd(w3, wallet_address, chain_name, eth_price_usd)
+            balances[wallet_name][chain_name] = balance
+    
+    return balances
 
 
 def estimate_gas_fee_usd(w3: Web3, eth_price_usd: float, gas_units: int = 150_000) -> float:
@@ -301,7 +321,7 @@ def quick_checks(
                     return result
         
         # =============================================================
-        # جلب الرصيد من السلسلة (مع التخزين المؤقت الخاص بها)
+        # جلب الرصيد من السلسلة
         # =============================================================
         balance_usd = get_wallet_balance_usd(w3, wallet_address, chain_name, eth_price_usd)
         result["balance_usd"] = balance_usd
@@ -312,7 +332,6 @@ def quick_checks(
             log.warning(f"⚠️ {chain_name} - رصيد منخفض: ${balance_usd:.4f} < ${MIN_BALANCE_RESERVE_USD}")
             return result
         
-        # تقدير الغاز
         try:
             gas_price_wei = w3.eth.gas_price
             result["gas_fee_usd"] = (gas_price_wei * 100000 / 1e18) * eth_price_usd
@@ -325,7 +344,6 @@ def quick_checks(
             log.warning(f"⚠️ {chain_name} - رسوم غاز مرتفعة: ${result['gas_fee_usd']:.4f} > ${MAX_GAS_FEE_USD}")
             return result
         
-        # جلب عنوان الرسوم
         fee_recipient = get_fee_recipient(w3, seadrop_address, nft_contract)
         result["fee_recipient"] = fee_recipient if fee_recipient else seadrop_address
         
@@ -467,7 +485,6 @@ def attempt_purchase(
             "chain": chain_name,
         }
     
-    # جلب الرصيد من السلسلة المحددة
     balance_usd = get_wallet_balance_usd(w3, wallet_address, chain_name, eth_price_usd)
     log.info(f"💰 {chain_name} - رصيد المحفظة قبل الشراء: ${balance_usd:.4f}")
     
