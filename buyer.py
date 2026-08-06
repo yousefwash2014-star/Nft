@@ -18,7 +18,7 @@ _balance_cache = {}  # المفتاح: f"{wallet_address}:{chain_name}"
 _balance_cache_lock = threading.Lock()
 
 MAX_RETRIES_BALANCE = 3
-BASE_RETRY_DELAY = 2.0
+BASE_RETRY_DELAY = 3.0  # زيادة التأخير الأساسي
 MAX_RETRY_DELAY = 30
 BALANCE_CHECK_INTERVAL = 10800  # 3 ساعات
 
@@ -112,7 +112,6 @@ def apply_poa_middleware(w3: Web3, chain_name: str) -> None:
     تطبيق POA middleware على كائن Web3 باستخدام طرق متعددة.
     """
     try:
-        # الطريقة 1: استخدام ExtraDataToPOAMiddleware (web3.py >= 6.0)
         from web3.middleware import ExtraDataToPOAMiddleware
         w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         log.info(f"✅ تم تطبيق POA middleware (ExtraDataToPOAMiddleware) على {chain_name}")
@@ -123,7 +122,6 @@ def apply_poa_middleware(w3: Web3, chain_name: str) -> None:
         log.debug(f"محاولة 1 فشلت: {e}")
 
     try:
-        # الطريقة 2: استخدام geth_poa_middleware (web3.py 5.x)
         from web3.middleware import geth_poa_middleware
         w3.middleware_onion.inject(geth_poa_middleware, layer=0)
         log.info(f"✅ تم تطبيق POA middleware (geth_poa_middleware) على {chain_name}")
@@ -134,7 +132,6 @@ def apply_poa_middleware(w3: Web3, chain_name: str) -> None:
         log.debug(f"محاولة 2 فشلت: {e}")
 
     try:
-        # الطريقة 3: استخدام poa_middleware (web3.py < 5.0)
         from web3.middleware import poa_middleware
         w3.middleware_onion.inject(poa_middleware, layer=0)
         log.info(f"✅ تم تطبيق POA middleware (poa_middleware) على {chain_name}")
@@ -144,26 +141,6 @@ def apply_poa_middleware(w3: Web3, chain_name: str) -> None:
     except Exception as e:
         log.debug(f"محاولة 3 فشلت: {e}")
 
-    try:
-        # الطريقة 4: إضافة middleware يدوياً باستخدام make_request
-        # هذه الطريقة تعمل مع جميع الإصدارات
-        from web3.middleware import http_retry_request_middleware
-        
-        # إضافة middleware مخصص لمعالجة POA
-        def poa_middleware(make_request, web3):
-            def middleware(method, params):
-                response = make_request(method, params)
-                # تعديل الاستجابة إذا لزم الأمر
-                return response
-            return middleware
-        
-        w3.middleware_onion.add(poa_middleware, 'poa_middleware')
-        log.info(f"✅ تم تطبيق POA middleware (مخصص) على {chain_name}")
-        return
-    except Exception as e:
-        log.debug(f"محاولة 4 فشلت: {e}")
-
-    # الطريقة 5: تجاهل POA middleware (قد تسبب مشاكل مع Robinhood)
     log.warning(f"⚠️ لم يتم تطبيق POA middleware على {chain_name}. قد تواجه مشاكل مع سلاسل POA.")
 
 
@@ -181,19 +158,47 @@ def get_web3_from_config(chain_config: dict) -> Web3:
         "Content-Type": "application/json",
     }
     
-    w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"headers": headers}))
+    import requests
+    session = requests.Session()
+    session.headers.update(headers)
+    
+    w3 = Web3(Web3.HTTPProvider(rpc_url, session=session, request_kwargs={"timeout": 30}))
 
-    # =============================================================
-    # تطبيق POA middleware لسلاسل POA (مثل Robinhood Chain)
-    # =============================================================
     if chain_config.get("is_poa", False):
         apply_poa_middleware(w3, chain_config.get("chain_name_display", "unknown"))
 
-    # التحقق من الاتصال
-    if not w3.is_connected():
-        log.warning(f"⚠️ {chain_config.get('chain_name_display', 'unknown')} - Web3 غير متصل")
+    # التحقق من الاتصال مع إعادة محاولة
+    for attempt in range(3):
+        try:
+            if w3.is_connected():
+                log.info(f"✅ {chain_config.get('chain_name_display', 'unknown')} - Web3 متصل")
+                return w3
+        except:
+            pass
+        log.warning(f"⚠️ {chain_config.get('chain_name_display', 'unknown')} - محاولة الاتصال {attempt + 1}/3")
+        time.sleep(2)
 
+    log.warning(f"⚠️ {chain_config.get('chain_name_display', 'unknown')} - Web3 غير متصل بعد 3 محاولات")
     return w3
+
+
+def is_web3_connected(w3: Web3, chain_name: str) -> bool:
+    """
+    التحقق من اتصال Web3 مع إعادة محاولة بسيطة.
+    """
+    try:
+        if w3.is_connected():
+            return True
+        block_number = w3.eth.block_number
+        return True
+    except Exception as e:
+        error_msg = str(e).lower()
+        if "429" in error_msg or "rate limit" in error_msg:
+            log.warning(f"⚠️ {chain_name} - Rate Limit، تأخير...")
+            time.sleep(3)
+            return False
+        log.warning(f"⚠️ {chain_name} - Web3 غير متصل: {e}")
+        return False
 
 
 def get_balance_cache_key(wallet_address: str, chain_name: str) -> str:
@@ -207,7 +212,6 @@ def get_wallet_balance_usd(w3: Web3, wallet_address: str, chain_name: str, eth_p
     """
     now = time.time()
 
-    # التحقق من صحة العنوان
     try:
         checksum_address = Web3.to_checksum_address(wallet_address)
     except Exception as e:
@@ -231,19 +235,15 @@ def get_wallet_balance_usd(w3: Web3, wallet_address: str, chain_name: str, eth_p
     # =============================================================
     for attempt in range(MAX_RETRIES_BALANCE):
         try:
-            # التحقق من اتصال Web3
-            if not w3.is_connected():
-                log.warning(f"⚠️ {chain_name} - Web3 غير متصل، محاولة إعادة الاتصال...")
-                try:
-                    w3.provider.make_request('eth_blockNumber', [])
-                except:
-                    pass
+            if not is_web3_connected(w3, chain_name):
+                log.warning(f"⚠️ {chain_name} - Web3 غير متصل، محاولة {attempt + 1}/{MAX_RETRIES_BALANCE}")
+                delay = 3 * (attempt + 1)
+                time.sleep(delay)
+                continue
 
-            # جلب الرصيد
             balance_wei = w3.eth.get_balance(checksum_address)
             balance_usd = (balance_wei / 1e18) * eth_price_usd
 
-            # تخزين النتيجة
             with _balance_cache_lock:
                 _balance_cache[cache_key] = (now, balance_usd)
 
@@ -252,12 +252,10 @@ def get_wallet_balance_usd(w3: Web3, wallet_address: str, chain_name: str, eth_p
 
         except Exception as e:
             error_msg = str(e).lower()
-
-            # تحليل نوع الخطأ
+            
             is_rate_limit = "429" in error_msg or "rate limit" in error_msg or "too many requests" in error_msg
             is_connection = "connection" in error_msg or "timeout" in error_msg or "connect" in error_msg
-            is_poa_error = "extra data" in error_msg or "uncle" in error_msg or "poa" in error_msg
-
+            
             if is_rate_limit:
                 delay = min(BASE_RETRY_DELAY * (2 ** attempt) + random.uniform(0, 0.5), MAX_RETRY_DELAY)
                 log.warning(f"⚠️ [RATE LIMIT] {chain_name} - محاولة {attempt + 1}/{MAX_RETRIES_BALANCE} - انتظار {delay:.1f} ثانية")
@@ -267,12 +265,6 @@ def get_wallet_balance_usd(w3: Web3, wallet_address: str, chain_name: str, eth_p
                 delay = 3 * (attempt + 1)
                 log.warning(f"⚠️ [CONNECTION] {chain_name} - محاولة {attempt + 1}/{MAX_RETRIES_BALANCE} - انتظار {delay} ثانية")
                 time.sleep(delay)
-                continue
-            elif is_poa_error:
-                log.warning(f"⚠️ [POA ERROR] {chain_name} - خطأ في POA: {e}")
-                # محاولة إعادة تطبيق POA middleware
-                apply_poa_middleware(w3, chain_name)
-                time.sleep(2)
                 continue
             else:
                 log.error(f"[الرصيد] {chain_name} - تعذر القراءة: {e}")
@@ -310,9 +302,8 @@ def get_all_wallets_balances(w3_instances: dict, wallets: list, eth_price_usd: f
                 log.error(f"❌ فشل جلب رصيد {wallet_name} على {chain_name}: {e}")
                 balances[wallet_name][chain_name] = 0.0
 
-        # تأخير بين المحافظ لتجنب Rate Limiting
         if idx < len(wallets) - 1:
-            time.sleep(1.0)
+            time.sleep(3.0)
 
     return balances
 
@@ -386,9 +377,6 @@ def quick_checks(
         now = time.time()
         cache_key = get_balance_cache_key(wallet_address, chain_name)
 
-        # =============================================================
-        # فحص الرصيد المخزن لهذه السلسلة
-        # =============================================================
         with _balance_cache_lock:
             if cache_key in _balance_cache:
                 last_check, balance = _balance_cache[cache_key]
@@ -420,9 +408,6 @@ def quick_checks(
                     result["pass"] = True
                     return result
 
-        # =============================================================
-        # جلب الرصيد من السلسلة
-        # =============================================================
         balance_usd = get_wallet_balance_usd(w3, wallet_address, chain_name, eth_price_usd)
         result["balance_usd"] = balance_usd
 
@@ -432,7 +417,6 @@ def quick_checks(
             log.warning(f"⚠️ {chain_name} - رصيد منخفض: ${balance_usd:.4f} < ${MIN_BALANCE_RESERVE_USD}")
             return result
 
-        # تقدير الغاز
         try:
             gas_price_wei = w3.eth.gas_price
             result["gas_fee_usd"] = (gas_price_wei * 100000 / 1e18) * eth_price_usd
@@ -445,7 +429,6 @@ def quick_checks(
             log.warning(f"⚠️ {chain_name} - رسوم غاز مرتفعة: ${result['gas_fee_usd']:.4f} > ${MAX_GAS_FEE_USD}")
             return result
 
-        # جلب عنوان الرسوم
         fee_recipient = get_fee_recipient(w3, seadrop_address, nft_contract)
         result["fee_recipient"] = fee_recipient if fee_recipient else seadrop_address
 
@@ -570,9 +553,6 @@ def attempt_purchase(
     """
     محاولة شراء واحدة - مع تحقق صارم من السعر.
     """
-    # =============================================================
-    # التحقق النهائي: السعر يجب أن يكون 0 فقط
-    # =============================================================
     if price_wei_per_token != 0:
         log.warning(f"⛔ {chain_name} - السعر ليس مجانياً: {price_wei_per_token} wei")
         return {
@@ -594,29 +574,17 @@ def attempt_purchase(
             "chain": chain_name,
         }
 
-    # =============================================================
-    # جلب الرصيد للتسجيل فقط
-    # =============================================================
     balance_usd = get_wallet_balance_usd(w3, wallet_address, chain_name, eth_price_usd)
     log.info(f"💰 {chain_name} - رصيد المحفظة قبل الشراء: ${balance_usd:.4f}")
 
-    # =============================================================
-    # تحديد الكمية
-    # =============================================================
     quantity = decide_quantity(max_per_wallet, remaining_supply)
     total_value = price_wei_per_token * quantity
 
-    # =============================================================
-    # فحص قيمة المعاملة (للأمان)
-    # =============================================================
     total_eth = total_value / 1e18
     if total_eth > MAX_ETH_PER_TX:
         log.warning(f"[أمان] {chain_name} - ⛔ قيمة المعاملة {total_eth:.6f} ETH > الحد الأقصى {MAX_ETH_PER_TX} ETH")
         return {"success": False, "reason": "tx_value_too_high", "tx_value_eth": total_eth, "chain": chain_name}
 
-    # =============================================================
-    # بناء وإرسال المعاملة
-    # =============================================================
     wallet_lock = get_wallet_lock(wallet_address)
     wallet_lock.acquire()
     signed_tx = None
@@ -625,13 +593,11 @@ def attempt_purchase(
         current_nonce = w3.eth.get_transaction_count(Web3.to_checksum_address(wallet_address), "pending")
         current_gas_price = w3.eth.gas_price
 
-        # جلب عنوان الرسوم
         fee_recipient = get_fee_recipient(w3, seadrop_address, nft_contract)
         if not fee_recipient:
             log.warning(f"⚠️ {chain_name} - لا يوجد عنوان رسوم، نحاول باستخدام عنوان افتراضي")
             fee_recipient = seadrop_address
 
-        # بناء المعاملة
         tx = contract.functions.mintPublic(
             Web3.to_checksum_address(nft_contract),
             Web3.to_checksum_address(fee_recipient),
@@ -645,7 +611,6 @@ def attempt_purchase(
             "chainId": w3.eth.chain_id,
         })
 
-        # تقدير الغاز
         try:
             estimated_gas = w3.eth.estimate_gas(tx)
             tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
@@ -654,7 +619,6 @@ def attempt_purchase(
             log.error(f"⚠️ {chain_name} - فشل estimate_gas: {e}")
             return {"success": False, "reason": "simulation_failed", "error": str(e), "chain": chain_name}
 
-        # التوقيع والإرسال
         signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
         raw_tx = getattr(signed_tx, 'raw_transaction', None)
         if raw_tx is None:
@@ -664,7 +628,6 @@ def attempt_purchase(
 
         tx_hash = w3.eth.send_raw_transaction(raw_tx)
 
-        # حساب رسوم الغاز الفعلية
         gas_used = tx.get("gas", 0)
         gas_fee_eth = (gas_used * current_gas_price) / 1e18
         gas_fee_usd = gas_fee_eth * eth_price_usd
@@ -684,7 +647,6 @@ def attempt_purchase(
         error_msg = str(e).lower()
         log.error(f"❌ {chain_name} - [خطأ إرسال] {e}")
 
-        # تحليل سبب الخطأ
         if "insufficient funds" in error_msg:
             reason = "insufficient_funds_for_total_cost"
             log.warning(f"⚠️ {chain_name} - رصيد غير كافٍ: ${balance_usd:.4f}")
