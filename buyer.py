@@ -1,640 +1,650 @@
 """
 محرك الشراء التلقائي عبر عقد SeaDrop على سلاسل متعددة (Ethereum + Robinhood).
-نسخة محسنة - رسوم الغاز محددة بـ 15 سنت مع إعادة محاولة سريعة كل 5 ثواني
-الشراء من جميع المحافظ بشكل متوازي
+
+يحتوي كل ضوابط الأمان بمكان واحد، بالترتيب الصحيح للتحقق:
+  1. الرصيد الحالي بالمحفظة (توقف لو منخفض جدًا)
+  2. رسوم الغاز الحالية (إلغاء لو مرتفعة)
+  3. عنوان الرسوم المسموح (يُقرأ من العقد نفسه، بدون تخمين)
+  4. تنفيذ المعاملة
+
+هذا الملف هو المسؤول عن:
+- الاتصال بشبكات الإيثيريوم والـ Robinhood Chain
+- التحقق من الرصيد ورسوم الغاز
+- استعلام عنوان الرسوم المسموح من العقد
+- بناء وتوقيع وإرسال معاملات المينت
 """
 
 import logging
 import threading
-import random
-import time
-from datetime import datetime, timezone
-from enum import Enum
-from dataclasses import dataclass, field
-from typing import Optional, List
+import time  # مكتبة الوقت
 from web3 import Web3
 
+# تهيئة مسجل الأحداث الخاص بالمشتري
 log = logging.getLogger("buyer")
 
+# 🔥 أضف هذه الأسطر
+
+_balance_cache = {}  # لتخزين الرصيد مؤقتاً
+_balance_cache_lock = threading.Lock()  # قفل لحماية الذاكرة
+
 # ===========================================================================
-# Nonce Management
+# نظام قفل Nonce - يمنع تضارب المعاملات المتزامنة
 # ===========================================================================
-nonce_locks = {}
-nonce_locks_lock = threading.Lock()
+# هذا القفل يضمن أن كل محفظة ترسل معاملة واحدة فقط في نفس الوقت
+# وبالتالي nonce صحيح لكل معاملة
+nonce_locks = {}          # قاموس الأقفال لكل محفظة
+nonce_locks_lock = threading.Lock()  # قفل لحماية قاموس الأقفال نفسه
 
 def get_wallet_lock(address: str) -> threading.Lock:
+    """
+    يرجع قفل خاص بالمحفظة.
+    كل محفظة لها قفل منفصل.
+    """
     with nonce_locks_lock:
         if address not in nonce_locks:
             nonce_locks[address] = threading.Lock()
         return nonce_locks[address]
 
 # ===========================================================================
-# Constants
+# الحد الأقصى المسموح به لقيمة المعاملة (ETH)
 # ===========================================================================
-MAX_ETH_PER_TX = 0.02
-MAX_GAS_FEE_USD = 0.15  # 🔥 15 سنت
-MIN_BALANCE_RESERVE_USD = 0.001
-GAS_LIMIT_SAFETY_MARGIN = 1.05  # 5% هامش أمان
-FREE_PRICE_THRESHOLD_WEI = 1000
+MAX_ETH_PER_TX = 0.02  # لا ترسل أكثر من 0.01 ETH في معاملة واحدة (حماية)
 
 # ===========================================================================
-# Chain Configurations
+# إعدادات السلاسل المدعومة
 # ===========================================================================
+# نحدد هنا كل سلسلة نريد دعمها، مع:
+# - متغير البيئة الخاص بـ RPC URL
+# - عنوان عقد SeaDrop (ثابت لكل سلسلة)
+# - اسم السلسلة للعرض
+# - العملة الأصلية (ETH في الحالتين)
+
 CHAINS_CONFIG = {
     "robinhood": {
-        "rpc_env_var": "ROBINHOOD_RPC_URL",
-        "seadrop_address": Web3.to_checksum_address("0x00005EA00Ac477B1030CE78506496e8C2dE24bf5"),
-        "chain_name_display": "Robinhood Chain",
-        "explorer_url": "https://explorer.robinhood.org/tx/",
+        "rpc_env_var": "ROBINHOOD_RPC_URL",                              # متغير البيئة لـ RPC
+        "seadrop_address": Web3.to_checksum_address("0x00005EA00Ac477B1030CE78506496e8C2dE24bf5"),  # عنوان عقد SeaDrop
+        "chain_name_display": "Robinhood Chain",                         # الاسم المعروض
+        "native_currency": "ETH",                                         # العملة الأصلية
     },
     "ethereum": {
-        "rpc_env_var": "ETHEREUM_RPC_URL",
-        "seadrop_address": Web3.to_checksum_address("0x00005EA00Ac477B1030CE78506496e8C2dE24bf5"),
-        "chain_name_display": "Ethereum Mainnet",
-        "explorer_url": "https://etherscan.io/tx/",
+        "rpc_env_var": "ETHEREUM_RPC_URL",                               # متغير البيئة لـ RPC
+        "seadrop_address": Web3.to_checksum_address("0x00005EA00Ac477B1030CE78506496e8C2dE24bf5"),  # عنوان عقد SeaDrop
+        "chain_name_display": "Ethereum Mainnet",                        # الاسم المعروض
+        "native_currency": "ETH",                                         # العملة الأصلية
     },
 }
 
+# عنوان الصفر (0x0...) المستخدم في معاملات المينت
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 # ===========================================================================
-# ABI Definitions
+# ABI (واجهة) عقد SeaDrop
 # ===========================================================================
+# هذه هي التواقيع التي نحتاجها من العقد:
+# - mintPublic: دالة المينت العامة
+# - getAllowedFeeRecipients: لاستعلام عنوان الرسوم المسموح
+
 SEADROP_ABI = [
     {
         "inputs": [
-            {"name": "nftContract", "type": "address"},
-            {"name": "feeRecipient", "type": "address"},
-            {"name": "minterIfNotPayer", "type": "address"},
-            {"name": "quantity", "type": "uint256"},
+            {"name": "nftContract", "type": "address"},     # عنوان عقد الـ NFT
+            {"name": "feeRecipient", "type": "address"},     # عنوان مستلم الرسوم
+            {"name": "minterIfNotPayer", "type": "address"}, # العنوان الذي سيقوم بالمينت (0x00 = الدافع نفسه)
+            {"name": "quantity", "type": "uint256"},         # الكمية المراد شراؤها
         ],
-        "name": "mintPublic",
-        "outputs": [],
-        "stateMutability": "payable",
+        "name": "mintPublic",                                # اسم الدالة
+        "outputs": [],                                       # لا مخرجات
+        "stateMutability": "payable",                        # تقبل دفع ETH
         "type": "function",
     },
     {
-        "inputs": [{"name": "nftContract", "type": "address"}],
-        "name": "getAllowedFeeRecipients",
-        "outputs": [{"name": "", "type": "address[]"}],
-        "stateMutability": "view",
+        "inputs": [{"name": "nftContract", "type": "address"}],  # عنوان عقد الـ NFT
+        "name": "getAllowedFeeRecipients",                        # اسم الدالة
+        "outputs": [{"name": "", "type": "address[]"}],           # ترجع مصفوفة من العناوين
+        "stateMutability": "view",                                # دالة قراءة فقط (مجانية)
         "type": "function",
     },
 ]
 
 # ===========================================================================
-# Enums & Data Classes
+# ضوابط قابلة للتعديل (إعدادات الأمان)
 # ===========================================================================
-class RetryStrategy(Enum):
-    FIXED = "fixed"
-    EXPONENTIAL = "exponential"
-    LINEAR = "linear"
+# هذه القيم تتحكم بسلوك الأمان للنظام:
+MAX_GAS_FEE_USD = 0.05      # ألغِ الشراء لو رسوم الغاز أعلى من هذا المبلغ
+MIN_BALANCE_RESERVE_USD = 0.05  # توقف عن الشراء لو الرصيد أقل من هذا المبلغ
+FEW_THRESHOLD = 10             # إذا كان الحد الأقصى 20 قطعة أو أقل، اشترِ الكل
+LIMITED_BUY_QTY = 10 # إذا كان الحد الأقصى أكثر من 20، اشترِ هذا العدد فقط
+GAS_LIMIT_SAFETY_MARGIN = 1.2   # هامش أمان 20% إضافي فوق تقدير الغاز
 
-@dataclass
-class RetryConfig:
-    max_attempts: int = 500
-    base_delay: float = 5  # 🔥 5 ثواني
-    max_delay: float = 60
-    strategy: RetryStrategy = RetryStrategy.FIXED
-    backoff_multiplier: float = 1.5
-    jitter: bool = True
-    max_total_hours: float = 4
 
-@dataclass
-class MintResult:
-    """نتيجة عملية الشراء"""
-    success: bool
-    wallet: str = ""
-    wallet_name: str = ""
-    tx_hash: str = ""
-    reason: str = ""
-    reason_text: str = ""
-    quantity: int = 0
-    gas_used_eth: float = 0.0
-    gas_used_usd: float = 0.0
-    gas_units: int = 0
-    gas_price_gwei: float = 0.0
-    gas_estimated: int = 0
-    balance_eth: float = 0.0
-    balance_usd: float = 0.0
-    total_value_eth: float = 0.0
-    price_wei: int = 0
-    chain_name: str = ""  # 🔥 إضافة اسم السلسلة
-
-# ===========================================================================
-# Retry Configurations - 🔥 جميع التأخيرات 5 ثواني
-# ===========================================================================
-REASON_RETRY_CONFIGS = {
-    "gas_too_high": RetryConfig(max_attempts=500, base_delay=5, max_delay=60, strategy=RetryStrategy.FIXED, max_total_hours=4),
-    "simulation_failed": RetryConfig(max_attempts=240, base_delay=5, max_delay=60, strategy=RetryStrategy.EXPONENTIAL, max_total_hours=8),
-    "tx_error": RetryConfig(max_attempts=720, base_delay=5, max_delay=60, strategy=RetryStrategy.EXPONENTIAL, max_total_hours=3),
-    "no_fee_recipient": RetryConfig(max_attempts=160, base_delay=5, max_delay=60, strategy=RetryStrategy.FIXED, max_total_hours=8),
-    "nonce_error": RetryConfig(max_attempts=180, base_delay=5, max_delay=60, strategy=RetryStrategy.LINEAR, max_total_hours=0.5),
-    "insufficient_funds": RetryConfig(max_attempts=72, base_delay=5, max_delay=60, strategy=RetryStrategy.FIXED, max_total_hours=12),
-}
-
-RETRYABLE_REASONS = set(REASON_RETRY_CONFIGS.keys())
-
-# ===========================================================================
-# Arabic Messages
-# ===========================================================================
-REASON_MESSAGES_AR = {
-    "balance_too_low": "💰 الرصيد منخفض",
-    "gas_too_high": "⛽ رسوم الغاز مرتفعة (الحد 15 سنت)",
-    "tx_value_too_high": "📊 قيمة المعاملة عالية",
-    "no_fee_recipient": "📝 تعذر عنوان الرسوم",
-    "simulation_failed": "🔍 فشلت المحاكاة",
-    "not_free_mint": "💲 ليس مجانياً",
-    "tx_error": "🌐 خطأ شبكة",
-    "nonce_error": "🔢 خطأ nonce",
-    "insufficient_funds": "💸 رصيد غير كاف",
-    "sold_out": "🏁 نفذت الكمية",
-    "not_eligible": "🚫 المحفظة غير مؤهلة",
-    "unknown": "❓ غير معروف",
-}
-
-def get_reason_text(reason: str) -> str:
-    if not reason:
-        return "❓ غير محدد"
-    return REASON_MESSAGES_AR.get(reason, f"⚠️ {reason}")
-
-# ===========================================================================
-# Utility Functions
-# ===========================================================================
-def is_price_free(price_wei: int) -> bool:
-    return price_wei <= FREE_PRICE_THRESHOLD_WEI
-
-def parse_stage_time(time_str: str) -> Optional[datetime]:
-    if not time_str:
-        return None
-    try:
-        return datetime.fromisoformat(time_str.replace("Z", "+00:00"))
-    except:
-        return None
-
-def get_stage_status(stage: dict) -> str:
-    now = datetime.now(timezone.utc)
-    start_dt = parse_stage_time(stage.get("start_time", ""))
-    end_dt = parse_stage_time(stage.get("end_time", ""))
-    if start_dt and now < start_dt:
-        return "upcoming"
-    if end_dt and now > end_dt:
-        return "ended"
-    if start_dt and now >= start_dt:
-        return "active"
-    return "unknown"
-
-def safe_parse_price(price_value) -> int:
-    if price_value is None:
-        return 0
-    try:
-        if isinstance(price_value, str):
-            price_value = price_value.strip()
-            if not price_value:
-                return 0
-            price_float = float(price_value)
-            if 0 < price_float < 1:
-                return int(price_float * 1e18)
-            return int(price_float)
-        if isinstance(price_value, (int, float)):
-            return int(price_value)
-        return 0
-    except:
-        return 0
-
-def extract_price_from_stage(stage: dict) -> int:
-    for field in ["price", "price_wei", "mint_price", "mintPrice", "cost", "value", "price_per_token", "pricePerToken"]:
-        value = stage.get(field)
-        if value is not None and value != "":
-            return safe_parse_price(value)
-    return 0
-
-def extract_stage_name(stage: dict) -> str:
-    """استخراج اسم المرحلة"""
-    for field in ["stage", "name", "phase", "title", "stage_name"]:
-        value = stage.get(field)
-        if value and isinstance(value, str) and value.strip():
-            return value.strip()
-    return "عام"
-
-def decide_quantity(max_per_wallet, remaining_supply):
-    if max_per_wallet is None:
-        return 1
-    qty = max_per_wallet if max_per_wallet <= 20 else 5
-    return max(1, min(qty, remaining_supply))
-
-# ===========================================================================
-# Core Functions
-# ===========================================================================
+# 🔥 أضف هذا السطر الجديد
+BALANCE_CHECK_INTERVAL = 10800  # فحص الرصيد كل ساعة (3600 ثانية
 def get_web3_from_config(chain_config: dict) -> Web3:
-    """إنشاء Web3 من التكوين مع تحقق أفضل"""
-    rpc_url = chain_config.get("rpc_url", "").strip()
+    """
+    إنشاء كائن Web3 من إعدادات سلسلة محددة.
+    تُستدعى هذه الدالة بعد تحميل متغيرات البيئة من ملف .env.
     
+    المعاملات:
+        chain_config: dict - إعدادات السلسلة (تحتوي على rpc_url)
+    
+    المخرجات:
+        Web3 - كائن Web3 جاهز للاستخدام
+    
+    الأخطاء:
+        ValueError - إذا لم يتم توفير RPC URL
+    """
+    # استخراج رابط RPC من الإعدادات
+    rpc_url = chain_config.get("rpc_url")
     if not rpc_url:
-        raise ValueError("RPC URL فارغ - تأكد من متغيرات البيئة")
-    
-    # التحقق من وجود مفاتيح عامة
-    PUBLIC_KEYS = ["alch_A1gYoxdzx_Zxz3SBG92Ox", "alch_ug5SYIto3LNu76VG3fZBk"]
-    
-    for key in PUBLIC_KEYS:
-        if key in rpc_url:
-            log.warning(f"⚠️ يتم استخدام مفتاح عام: {key[:20]}...")
-            log.warning("   💡 يرجى استخدام مفاتيح Alchemy الخاصة بك في ملف .env")
-            break
-    
-    # إنشاء Web3 مع زيادة وقت المهلة
-    w3 = Web3(Web3.HTTPProvider(
-        rpc_url,
-        request_kwargs={
-            'timeout': 30,  # زيادة المهلة إلى 30 ثانية
-            'headers': {'Content-Type': 'application/json'}
-        }
-    ))
-    
-    return w3
+        raise ValueError(f"لا يوجد RPC URL للسلسلة: {chain_config.get('chain_name_display', 'unknown')}")
+    return Web3(Web3.HTTPProvider(rpc_url))
 
-def get_wallet_balance(w3: Web3, wallet_address: str, retries=3) -> tuple:
-    """الحصول على الرصيد مع إعادة محاولة عند 429"""
-    for attempt in range(retries):
-        try:
-            balance_wei = w3.eth.get_balance(Web3.to_checksum_address(wallet_address))
-            return balance_wei / 1e18, balance_wei
-        except Exception as e:
-            error_msg = str(e)
-            if "429" in error_msg and attempt < retries - 1:
-                wait = (attempt + 1) * 2
-                log.warning(f"⏳ 429 - انتظار {wait} ثانية...")
-                time.sleep(wait)
-                continue
-            elif attempt == retries - 1:
-                raise
-            else:
-                raise
-    return 0.0, 0
 
-def get_fee_recipient(w3: Web3, seadrop_address: str, nft_contract: str) -> Optional[str]:
+def get_wallet_balance_usd(w3: Web3, wallet_address: str, eth_price_usd: float) -> float:
+    """
+    يرجع رصيد المحفظة بالدولار - مع تخزين مؤقت.
+    """
+    now = time.time()
+    
+    with _balance_cache_lock:
+        # التحقق من وجود رصيد مخزن
+        if wallet_address in _balance_cache:
+            last_check, balance = _balance_cache[wallet_address]
+            if now - last_check < BALANCE_CHECK_INTERVAL:
+                return balance
+    
+    # إذا لم يكن هناك رصيد مخزن أو انتهت صلاحيته
     try:
-        contract = w3.eth.contract(
-            address=Web3.to_checksum_address(seadrop_address),
-            abi=SEADROP_ABI
-        )
-        recipients = contract.functions.getAllowedFeeRecipients(
+        balance_wei = w3.eth.get_balance(Web3.to_checksum_address(wallet_address))
+        balance_usd = (balance_wei / 1e18) * eth_price_usd
+        
+        with _balance_cache_lock:
+            _balance_cache[wallet_address] = (now, balance_usd)
+        
+        return balance_usd
+    except Exception as e:
+        log.error(f"[الرصيد] تعذر القراءة: {e}")
+        # استخدم آخر قيمة معروفة
+        with _balance_cache_lock:
+            if wallet_address in _balance_cache:
+                return _balance_cache[wallet_address][1]
+        return 0.0
+
+
+def estimate_gas_fee_usd(w3: Web3, eth_price_usd: float, gas_units: int = 150_000) -> float:
+    """
+    تقدير أولي سريع لرسوم معاملة عادية، قبل بناء المعاملة الفعلية.
+    يُستخدم هذا الفحص السريع لتصفية الرسوم المرتفعة دون إضاعة وقت.
+    
+    المعاملات:
+        w3: Web3 - كائن Web3 متصل
+        eth_price_usd: float - سعر ETH الحالي بالدولار
+        gas_units: int - عدد وحدات الغاز المتوقعة (افتراضي 150,000)
+    
+    المخرجات:
+        float - رسوم الغاز المقدرة بالدولار (أو ما لا نهاية عند الخطأ)
+    """
+    try:
+        # جلب سعر الغاز الحالي وحساب التكلفة
+        gas_price_wei = w3.eth.gas_price
+        fee_eth = (gas_price_wei * gas_units) / 1e18
+        return fee_eth * eth_price_usd
+    except Exception as e:
+        # في حالة الخطأ، نسجل تحذيرًا ونرجع ما لا نهاية (يمنع الشراء)
+        log.warning(f"[الغاز] تعذر التقدير: {e}")
+        return float("inf")  # عند الشك، اعتبرها عالية جدًا ولا تشترِ
+
+
+def get_fee_recipient(w3: Web3, seadrop_address: str, nft_contract: str) -> str | None:
+    """
+    يسأل عقد SeaDrop مباشرة عن عنوان الرسوم المسموح لهذا العقد تحديدًا.
+    هذا أكثر أمانًا من تخمين العنوان أو استخدام عنوان ثابت.
+    
+    المعاملات:
+        w3: Web3 - كائن Web3 متصل
+        seadrop_address: str - عنوان عقد SeaDrop
+        nft_contract: str - عنوان عقد الـ NFT
+    
+    المخرجات:
+        str | None - عنوان مستلم الرسوم الأول، أو None إذا لم يوجد
+    """
+    try:
+        # إنشاء كائن العقد واستدعاء الدالة
+        seadrop = w3.eth.contract(address=Web3.to_checksum_address(seadrop_address), abi=SEADROP_ABI)
+        recipients = seadrop.functions.getAllowedFeeRecipients(
             Web3.to_checksum_address(nft_contract)
         ).call()
-        return recipients[0] if recipients else None
-    except:
+        # التحقق من وجود عنوان مسموح
+        if not recipients:
+            log.warning(f"[عنوان الرسوم] لا يوجد عنوان مسموح لـ {nft_contract}")
+            return None
+        return recipients[0]  # نأخذ أول عنوان مسموح
+    except Exception as e:
+        log.error(f"[عنوان الرسوم] خطأ استعلام: {e}")
         return None
 
-def quick_checks(w3, wallet_address, eth_price_usd, nft_contract, seadrop_address, quantity=1, price_wei=0):
-    """فحص الرصيد وعنوان الرسوم مع تقدير الغاز الفعلي"""
-    balance_eth, balance_wei = get_wallet_balance(w3, wallet_address)
-    balance_usd = balance_eth * eth_price_usd
-    
-    # تقدير الغاز الفعلي
-    gas_eth = 0
-    gas_usd = 0
-    try:
-        gas_price = w3.eth.gas_price
-        gas_units = 150000
-        gas_eth = (gas_price * gas_units) / 1e18
-        gas_usd = gas_eth * eth_price_usd
-    except:
-        pass
-    
-    # التحقق من رسوم الغاز
-    if gas_usd > MAX_GAS_FEE_USD:
-        return {
-            "pass": False,
-            "reason": "gas_too_high",
-            "balance_eth": balance_eth,
-            "balance_usd": balance_usd,
-            "gas_eth": gas_eth,
-            "gas_usd": gas_usd,
-            "fee_recipient": None,
-        }
-    
-    fee_recipient = get_fee_recipient(w3, seadrop_address, nft_contract)
-    if not fee_recipient:
-        return {
-            "pass": False,
-            "reason": "no_fee_recipient",
-            "balance_eth": balance_eth,
-            "balance_usd": balance_usd,
-            "gas_eth": gas_eth,
-            "gas_usd": gas_usd,
-            "fee_recipient": None,
-        }
-    
-    return {
-        "pass": True,
-        "reason": "ok",
-        "balance_eth": balance_eth,
-        "balance_usd": balance_usd,
-        "gas_eth": gas_eth,
-        "gas_usd": gas_usd,
-        "fee_recipient": fee_recipient,
-    }
 
-# ===========================================================================
-# ✅ محاولة الشراء
-# ===========================================================================
-def attempt_purchase(w3, private_key, wallet_address, nft_contract, seadrop_address, price_wei, max_per_wallet, remaining_supply, eth_price_usd):
-    """محاولة شراء NFT - مع حد غاز 15 سنت"""
+def decide_quantity(max_per_wallet: int | None, remaining_supply: int) -> int:
+    """
+    تحدد الكمية المناسبة للشراء بناءً على:
+    - max_per_wallet <= 20  => اشترِ الحد الأقصى المسموح
+    - max_per_wallet > 20   => اشترِ 5 فقط (تفادي مينتات ذات كمية ضخمة)
+    - max_per_wallet مجهول  => اشترِ قطعة واحدة فقط (أمان)
     
-    # التحقق من أن السعر مجاني
-    if not is_price_free(price_wei):
-        return MintResult(
-            success=False,
-            wallet=wallet_address,
-            reason="not_free_mint",
-            reason_text=get_reason_text("not_free_mint"),
-            price_wei=price_wei,
-        )
+    المعاملات:
+        max_per_wallet: int | None - الحد الأقصى لكل محفظة
+        remaining_supply: int - الكمية المتبقية من المينت
     
-    # الحصول على الرصيد
-    balance_eth, balance_wei = get_wallet_balance(w3, wallet_address)
-    balance_usd = balance_eth * eth_price_usd
-    
-    # تحديد الكمية
-    quantity = decide_quantity(max_per_wallet, remaining_supply)
-    total_value_wei = price_wei * quantity
-    total_value_eth = total_value_wei / 1e18
-    
-    # التحقق من قيمة المعاملة
-    if total_value_eth > MAX_ETH_PER_TX:
-        return MintResult(
-            success=False,
-            wallet=wallet_address,
-            reason="tx_value_too_high",
-            reason_text=get_reason_text("tx_value_too_high"),
-            balance_eth=balance_eth,
-            balance_usd=balance_usd,
-        )
-    
-    # الحصول على قفل المحفظة
-    wallet_lock = get_wallet_lock(wallet_address)
-    
-    with wallet_lock:
-        try:
-            # إنشاء عقد SeaDrop
-            contract = w3.eth.contract(
-                address=Web3.to_checksum_address(seadrop_address),
-                abi=SEADROP_ABI
-            )
-            
-            # الحصول على nonce
-            nonce = w3.eth.get_transaction_count(
-                Web3.to_checksum_address(wallet_address),
-                "pending"
-            )
-            
-            # الحصول على سعر الغاز
-            gas_price = w3.eth.gas_price
-            
-            # الحصول على عنوان الرسوم
-            fee_recipient = get_fee_recipient(w3, seadrop_address, nft_contract)
-            if not fee_recipient:
-                return MintResult(
-                    success=False,
-                    wallet=wallet_address,
-                    reason="no_fee_recipient",
-                    reason_text=get_reason_text("no_fee_recipient"),
-                    balance_eth=balance_eth,
-                    balance_usd=balance_usd,
-                )
-            
-            # بناء المعاملة
-            tx = contract.functions.mintPublic(
-                Web3.to_checksum_address(nft_contract),
-                Web3.to_checksum_address(fee_recipient),
-                Web3.to_checksum_address(ZERO_ADDRESS),
-                quantity,
-            ).build_transaction({
-                "from": Web3.to_checksum_address(wallet_address),
-                "value": total_value_wei,
-                "nonce": nonce,
-                "gasPrice": gas_price,
-                "chainId": w3.eth.chain_id,
-            })
-            
-            # تقدير الغاز
-            try:
-                estimated_gas = w3.eth.estimate_gas(tx)
-                tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
-                
-                gas_price_gwei = gas_price / 1e9
-                gas_eth = (tx["gas"] * gas_price) / 1e18
-                gas_usd = gas_eth * eth_price_usd
-                
-                # التحقق النهائي من الغاز
-                if gas_usd > MAX_GAS_FEE_USD:
-                    return MintResult(
-                        success=False,
-                        wallet=wallet_address,
-                        reason="gas_too_high",
-                        reason_text=get_reason_text("gas_too_high"),
-                        gas_units=tx["gas"],
-                        gas_estimated=estimated_gas,
-                        gas_price_gwei=gas_price_gwei,
-                        gas_used_usd=gas_usd,
-                        balance_eth=balance_eth,
-                        balance_usd=balance_usd,
-                    )
-                
-            except Exception as e:
-                return MintResult(
-                    success=False,
-                    wallet=wallet_address,
-                    reason="simulation_failed",
-                    reason_text=get_reason_text("simulation_failed"),
-                    balance_eth=balance_eth,
-                    balance_usd=balance_usd,
-                )
-            
-            # توقيع المعاملة
-            signed_tx = w3.eth.account.sign_transaction(tx, private_key)
-            
-            # إرسال المعاملة
-            tx_hash = w3.eth.send_raw_transaction(signed_tx.rawTransaction if hasattr(signed_tx, 'rawTransaction') else signed_tx.raw_transaction)
-            tx_hash_str = tx_hash.hex() if hasattr(tx_hash, 'hex') else str(tx_hash)
-            
-            # حساب تكلفة الغاز
-            gas_used_eth = (tx["gas"] * gas_price) / 1e18
-            gas_used_usd = gas_used_eth * eth_price_usd
-            
-            # نجاح
-            return MintResult(
-                success=True,
-                wallet=wallet_address,
-                tx_hash=tx_hash_str,
-                quantity=quantity,
-                gas_used_eth=gas_used_eth,
-                gas_used_usd=gas_used_usd,
-                gas_units=tx["gas"],
-                gas_price_gwei=gas_price_gwei,
-                gas_estimated=estimated_gas,
-                total_value_eth=total_value_eth,
-                balance_eth=balance_eth,
-                balance_usd=balance_usd,
-            )
-            
-        except Exception as e:
-            error_msg = str(e).lower()
-            
-            # تحديد سبب الفشل
-            if "insufficient funds" in error_msg:
-                reason = "insufficient_funds"
-            elif "gas" in error_msg:
-                reason = "gas_too_high"
-            elif "nonce" in error_msg:
-                reason = "nonce_error"
-            elif "revert" in error_msg or "execution reverted" in error_msg:
-                reason = "simulation_failed"
-            else:
-                reason = "tx_error"
-            
-            return MintResult(
-                success=False,
-                wallet=wallet_address,
-                reason=reason,
-                reason_text=get_reason_text(reason),
-                balance_eth=balance_eth,
-                balance_usd=balance_usd,
-                price_wei=price_wei,
-            )
-
-# ===========================================================================
-# Stage Discovery Functions
-# ===========================================================================
-def extract_all_stages_raw(detail: dict) -> list:
-    """استخراج جميع المراحل من البيانات"""
-    all_stages = []
-    
-    if detail.get("active_stage"):
-        all_stages.append(detail["active_stage"])
-    
-    for s in detail.get("stages", []):
-        all_stages.append(s)
-    
-    for p in detail.get("phases", []):
-        all_stages.append(p)
-    
-    for m in detail.get("mint_stages", []):
-        all_stages.append(m)
-    
-    if detail.get("public_mint"):
-        all_stages.append(detail["public_mint"])
-    
-    if detail.get("allow_list"):
-        all_stages.append(detail["allow_list"])
-    
-    return all_stages
-
-def find_all_free_stages(detail: dict, wallets=None) -> dict:
-    """اكتشاف جميع المراحل المجانية"""
-    result = {"active": [], "upcoming": [], "ended": []}
-    all_stages = extract_all_stages_raw(detail)
-    seen = set()
-    
-    for stage in all_stages:
-        price_wei = extract_price_from_stage(stage)
-        if not is_price_free(price_wei):
-            continue
-        
-        stage_name = extract_stage_name(stage)
-        start_time = stage.get("start_time") or stage.get("startTime") or ""
-        stage_id = f"{stage_name}_{start_time}"
-        
-        if stage_id in seen:
-            continue
-        seen.add(stage_id)
-        
-        status = get_stage_status(stage)
-        start_dt = parse_stage_time(start_time)
-        end_dt = parse_stage_time(stage.get("end_time") or stage.get("endTime") or "")
-        
-        result[status].append({
-            **stage,
-            "stage": stage_name,
-            "price_wei": price_wei,
-            "price_eth": price_wei / 1e18,
-            "status": status,
-            "start_dt": start_dt,
-            "end_dt": end_dt,
-        })
-    
-    return result
-
-def get_all_stages_info(detail: dict, wallets=None) -> dict:
-    """معلومات جميع المراحل"""
-    result = {
-        "all_stages": [],
-        "free_active": [],
-        "free_upcoming": [],
-        "paid_active": [],
-        "paid_upcoming": [],
-        "total": 0,
-    }
-    
-    all_stages = extract_all_stages_raw(detail)
-    result["total"] = len(all_stages)
-    seen = set()
-    
-    for stage in all_stages:
-        price_wei = extract_price_from_stage(stage)
-        stage_name = extract_stage_name(stage)
-        start_time = stage.get("start_time") or stage.get("startTime") or ""
-        stage_id = f"{stage_name}_{start_time}"
-        
-        if stage_id in seen:
-            continue
-        seen.add(stage_id)
-        
-        status = get_stage_status(stage)
-        is_free = is_price_free(price_wei)
-        
-        info = {
-            "name": stage_name,
-            "type": "public",
-            "price_wei": price_wei,
-            "price_eth": price_wei / 1e18,
-            "price_usd": (price_wei / 1e18) * 3000,
-            "max_per_wallet": stage.get("max_per_wallet") or stage.get("maxPerWallet"),
-            "start_time": start_time,
-            "end_time": stage.get("end_time") or stage.get("endTime") or "",
-            "status": status,
-            "is_free": is_free,
-        }
-        
-        result["all_stages"].append(info)
-        
-        if is_free and status == "active":
-            result["free_active"].append(info)
-        elif is_free and status == "upcoming":
-            result["free_upcoming"].append(info)
-        elif not is_free and status == "active":
-            result["paid_active"].append(info)
-        elif not is_free and status == "upcoming":
-            result["paid_upcoming"].append(info)
-    
-    return result
-
-# ===========================================================================
-# Retry Logic
-# ===========================================================================
-def get_retry_config(reason: str) -> RetryConfig:
-    return REASON_RETRY_CONFIGS.get(reason, REASON_RETRY_CONFIGS["gas_too_high"])
-
-def calculate_retry_delay(config: RetryConfig, attempt_count: int) -> float:
-    if config.strategy == RetryStrategy.FIXED:
-        delay = config.base_delay
-    elif config.strategy == RetryStrategy.EXPONENTIAL:
-        delay = config.base_delay * (config.backoff_multiplier ** (attempt_count - 1))
-    elif config.strategy == RetryStrategy.LINEAR:
-        delay = config.base_delay * attempt_count
+    المخرجات:
+        int - الكمية التي سيتم شراؤها (على الأقل 1، وعلى الأكثر الكمية المتبقية)
+    """
+    # تحديد الكمية بناءً على القواعد
+    if max_per_wallet is None:
+        qty = 1                     # أمان: إذا لا يوجد حد، اشترِ قطعة واحدة
+    elif max_per_wallet <= FEW_THRESHOLD:
+        qty = max_per_wallet        # كمية قليلة: اشترِ الكل
     else:
-        delay = config.base_delay
-    delay = min(delay, config.max_delay)
-    if config.jitter:
-        delay *= random.uniform(0.75, 1.25)
-    return delay
+        qty = LIMITED_BUY_QTY       # كمية كبيرة: حددها بـ 5
+    
+    # التأكد من أن الكمية بين 1 والكمية المتبقية
+    return max(1, min(qty, remaining_supply))
+
+
+# ===========================================================================
+# فحوصات سريعة (تستخدم قبل بناء المعاملة)
+# ===========================================================================
+# هذه الدالة تُجري الفحوصات الأولية الثلاثة (الرصيد، الغاز، عنوان الرسوم)
+# في خطوة واحدة سريعة لتجنب إضاعة الوقت في المعاملات غير المجدية
+
+def quick_checks(
+    w3: Web3,
+    wallet_address: str,
+    eth_price_usd: float,
+    nft_contract: str,
+    seadrop_address: str,
+) -> dict:
+    """
+    فحوصات أولية سريعة - مع تخزين الرصيد مؤقتاً (فحص كل 3 ساعات)
+    """
+    result = {
+        "pass": True,
+        "reason": "",
+        "balance_usd": 0,
+        "gas_fee_usd": 0,
+        "fee_recipient": None,
+    }
+    
+    try:
+        # =============================================================
+        # 🔥 فحص الرصيد مع تخزين مؤقت (كل 3 ساعات)
+        # =============================================================
+        now = time.time()
+        
+        # تحقق من وجود رصيد مخزن لهذه المحفظة
+        with _balance_cache_lock:
+            if wallet_address in _balance_cache:
+                last_check, balance = _balance_cache[wallet_address]
+                time_since = now - last_check
+                
+                # إذا مر أقل من 3 ساعات، استخدم الرصيد المخزن
+                if time_since < BALANCE_CHECK_INTERVAL:
+                    result["balance_usd"] = balance
+                    log.info(f"💰 رصيد مخزن لـ {wallet_address[:10]}: ${balance:.4f} (منذ {time_since/3600:.1f} ساعة)")
+                    
+                    # تقدير الغاز (سريع)
+                    try:
+                        gas_price_wei = w3.eth.gas_price
+                        result["gas_fee_usd"] = (gas_price_wei * 100000 / 1e18) * eth_price_usd
+                    except:
+                        result["gas_fee_usd"] = 0.01
+                    
+                    # عنوان الرسوم (استخدم قيمة افتراضية سريعة)
+                    result["fee_recipient"] = seadrop_address
+                    
+                    return result
+        
+        # =============================================================
+        # إذا مرت 3 ساعات أو أكثر، افحص الرصيد
+        # =============================================================
+        balance_usd = get_wallet_balance_usd(w3, wallet_address, eth_price_usd)
+        result["balance_usd"] = balance_usd
+        
+        # خزن الرصيد مع وقت الفحص
+        with _balance_cache_lock:
+            _balance_cache[wallet_address] = (now, balance_usd)
+        
+        log.info(f"💰 رصيد محدث لـ {wallet_address[:10]}: ${balance_usd:.4f}")
+        
+        # تقدير الغاز
+        try:
+            gas_price_wei = w3.eth.gas_price
+            result["gas_fee_usd"] = (gas_price_wei * 100000 / 1e18) * eth_price_usd
+        except:
+            result["gas_fee_usd"] = 0.01
+        
+        # جلب عنوان الرسوم (مرة واحدة فقط عند التحديث)
+        fee_recipient = get_fee_recipient(w3, seadrop_address, nft_contract)
+        result["fee_recipient"] = fee_recipient if fee_recipient else seadrop_address
+        
+        result["pass"] = True
+        return result
+        
+    except Exception as e:
+        log.error(f"⚠️ خطأ في quick_checks: {e}")
+        result["pass"] = True
+        return result
+        
+        # =============================================================
+        # إذا مرت ساعة أو أكثر، افحص الرصيد
+        # =============================================================
+        balance_usd = get_wallet_balance_usd(w3, wallet_address, eth_price_usd)
+        result["balance_usd"] = balance_usd
+        
+        # خزن الرصيد مع وقت الفحص
+        with _balance_cache_lock:
+            _balance_cache[wallet_address] = (now, balance_usd)
+        
+        log.info(f"💰 رصيد محدث لـ {wallet_address[:10]}: ${balance_usd:.4f}")
+        
+        # الفحص 2: تقدير الغاز
+        gas_fee_usd = estimate_gas_fee_usd(w3, eth_price_usd)
+        result["gas_fee_usd"] = gas_fee_usd
+        log.info(f"⛽ رسوم الغاز المقدرة: ${gas_fee_usd:.4f}")
+        
+        # الفحص 3: جلب عنوان الرسوم
+        fee_recipient = get_fee_recipient(w3, seadrop_address, nft_contract)
+        result["fee_recipient"] = fee_recipient
+        
+        if not fee_recipient:
+            log.warning(f"⚠️ لا يوجد عنوان رسوم لـ {nft_contract}")
+        
+        result["pass"] = True
+        return result
+        
+    except Exception as e:
+        log.error(f"⚠️ خطأ في quick_checks: {e}")
+        result["pass"] = True
+        return result
+
+# ===========================================================================
+# دوال مساعدة لتحليل أسباب الفشل وإعادة المحاولة
+# ===========================================================================
+
+# أسباب الفشل التي تستحق إعادة المحاولة (قابلة للتغير مع الوقت)
+RETRYABLE_REASONS = {
+    "gas_too_high",           # رسوم الغاز قد تنخفض لاحقًا
+    "gas_too_high_precise",   # نفس الشيء بعد التقدير الدقيق
+    "tx_error",               # خطأ في الشبكة قد يختفي
+    "simulation_failed",      # المحاكاة قد تنجح لاحقًا (لو المينت مازال مغلق)
+    "no_fee_recipient",       # قد يكون المينت غير نشط بعد، نعيد المحاولة
+}
+
+
+def is_paid_mint(price_wei: int, eth_price_usd: float, threshold_usd: float = 0.01) -> tuple:
+    """
+    التحقق مما إذا كان المينت مدفوعًا أم مجانيًا.
+    
+    المعاملات:
+        price_wei: int - السعر بـ Wei
+        eth_price_usd: float - سعر ETH الحالي بالدولار
+        threshold_usd: float - الحد الفاصل بين المجاني والمدفوع (افتراضي 0.01 دولار)
+    
+    المخرجات:
+        tuple: (is_paid: bool, price_usd: float, label: str)
+        - is_paid: True إذا كان مدفوعًا، False إذا كان مجانيًا
+        - price_usd: السعر بالدولار
+        - label: نص وصفي (مدفوع / مجاني)
+    """
+    if price_wei <= 0:
+        return False, 0.0, "مجاني"
+    
+    price_usd = (price_wei / 1e18) * eth_price_usd
+    if price_usd < threshold_usd:
+        return False, price_usd, "مجاني (أقل من 1 سنت)"
+    
+    return True, price_usd, "مدفوع"
+
+
+def check_eligibility_reason(reason: str) -> dict:
+    """
+    تحليل سبب الفشل وتحديد:
+    - هل المشكلة من المستخدم (غير مؤهل) أم من الشبكة/الغاز (مؤهل لكن الظروف غير مناسبة)
+    
+    المعاملات:
+        reason: str - سبب الفشل من attempt_purchase أو quick_checks
+    
+    المخرجات:
+        dict: {
+            eligible: bool,          # هل المستخدم مؤهل للمشاركة؟
+            issue_type: str,         # نوع المشكلة (network / wallet / contract / unknown)
+            description: str,         # وصف المشكلة للمستخدم
+            retryable: bool,         # هل تستحق إعادة المحاولة؟
+        }
+    """
+    
+    # مشاكل الشبكة والغاز - المستخدم مؤهل لكن الظروف غير مناسبة
+    if reason in ("gas_too_high", "gas_too_high_precise"):
+        return {
+            "eligible": True,
+            "issue_type": "network",
+            "description": "رسوم الغاز مرتفعة حاليًا، أنت مؤهل لكن الشبكة مزدحمة",
+            "retryable": True,
+        }
+    
+    # مشاكل المحفظة - المستخدم غير مؤهل بسبب نقص الرصيد
+    if reason == "balance_too_low":
+        return {
+            "eligible": False,
+            "issue_type": "wallet",
+            "description": "الرصيد في المحفظة غير كافٍ، تحتاج تمويل المحفظة",
+            "retryable": False,
+        }
+    
+    if reason == "insufficient_funds_for_total_cost":
+        return {
+            "eligible": False,
+            "issue_type": "wallet",
+            "description": "الرصيد لا يكفي لتغطية سعر المينت + رسوم الغاز معًا",
+            "retryable": False,
+        }
+    
+    if reason == "tx_value_too_high":
+        return {
+            "eligible": True,
+            "issue_type": "safe",
+            "description": "قيمة المعاملة تجاوزت الحد الأقصى المسموح به في الإعدادات",
+            "retryable": False,
+        }
+    
+    # مشاكل العقد - المستخدم مؤهل لكن العقد لا يستجيب أو المينت غير متاح
+    if reason == "no_fee_recipient":
+        return {
+            "eligible": True,
+            "issue_type": "contract",
+            "description": "تعذر الحصول على عنوان الرسوم من العقد، قد يكون المينت غير نشط بعد",
+            "retryable": True,
+        }
+    
+    if reason == "simulation_failed":
+        return {
+            "eligible": True,
+            "issue_type": "contract",
+            "description": "فشلت محاكاة المعاملة — قد لا يكون المينت متاحًا حاليًا",
+            "retryable": True,
+        }
+    
+    # خطأ عام في إرسال المعاملة
+    if reason == "tx_error":
+        return {
+            "eligible": True,
+            "issue_type": "network",
+            "description": "حدث خطأ أثناء إرسال المعاملة — مشكلة شبكة مؤقتة",
+            "retryable": True,
+        }
+    
+    # أسباب غير معروفة
+    return {
+        "eligible": False,
+        "issue_type": "unknown",
+        "description": f"سبب غير معروف: {reason}",
+        "retryable": False,
+    }
+
+
+# ===========================================================================
+# الدالة الرئيسية: تنفذ كل الفحوصات بالترتيب، ثم الشراء إن نجحت كلها
+# ===========================================================================
+# هذه هي الدالة النهائية التي تقوم بكل شيء:
+# 1. تتحقق من الرصيد
+# 2. تتحقق من الغاز
+# 3. تستعلم عن عنوان الرسوم
+# 4. تحدد الكمية
+# 5. تبني المعاملة
+# 6. تقدر الغاز الفعلي
+# 7. تتحقق من التكلفة النهائية
+# 8. ترسل المعاملة
+def attempt_purchase(
+    w3: Web3,
+    private_key: str,
+    wallet_address: str,
+    nft_contract: str,
+    seadrop_address: str,
+    price_wei_per_token: int,
+    max_per_wallet: int | None,
+    remaining_supply: int,
+    eth_price_usd: float,
+) -> dict:
+    """
+    محاولة شراء واحدة - مع تحقق صارم من السعر
+    """
+    
+    # =============================================================
+    # 🔴 التحقق النهائي: السعر يجب أن يكون 0 فقط
+    # =============================================================
+    if price_wei_per_token != 0:
+        log.warning(f"⛔ السعر ليس مجانياً: {price_wei_per_token} wei")
+        return {
+            "success": False, 
+            "reason": "not_free_mint",
+            "price_wei": price_wei_per_token,
+            "balance_usd": 0,
+        }
+    
+    # تحقق إضافي: السعر بالدولار يجب أن يكون صفراً
+    price_usd = (price_wei_per_token / 1e18) * eth_price_usd
+    if price_usd > 0.0000000001:  # عملياً صفر
+        log.warning(f"⛔ السعر ليس مجانياً: ${price_usd:.10f}")
+        return {
+            "success": False, 
+            "reason": "not_free_mint",
+            "price_usd": price_usd,
+            "balance_usd": 0,
+        }
+    
+    # =============================================================
+    # جلب الرصيد للتسجيل فقط
+    # =============================================================
+    balance_usd = get_wallet_balance_usd(w3, wallet_address, eth_price_usd)
+    log.info(f"💰 رصيد المحفظة قبل الشراء: ${balance_usd:.4f}")
+    
+    # =============================================================
+    # تحديد الكمية
+    # =============================================================
+    quantity = decide_quantity(max_per_wallet, remaining_supply)
+    total_value = price_wei_per_token * quantity
+    
+    # =============================================================
+    # فحص قيمة المعاملة (للأمان)
+    # =============================================================
+    total_eth = total_value / 1e18
+    if total_eth > MAX_ETH_PER_TX:
+        log.warning(f"[أمان] ⛔ قيمة المعاملة {total_eth:.6f} ETH > الحد الأقصى {MAX_ETH_PER_TX} ETH")
+        return {"success": False, "reason": "tx_value_too_high", "tx_value_eth": total_eth}
+
+    # =============================================================
+    # بناء وإرسال المعاملة
+    # =============================================================
+    wallet_lock = get_wallet_lock(wallet_address)
+    wallet_lock.acquire()
+    signed_tx = None
+    try:
+        contract = w3.eth.contract(address=Web3.to_checksum_address(seadrop_address), abi=SEADROP_ABI)
+        current_nonce = w3.eth.get_transaction_count(Web3.to_checksum_address(wallet_address), "pending")
+        current_gas_price = w3.eth.gas_price
+        
+        # جلب عنوان الرسوم
+        fee_recipient = get_fee_recipient(w3, seadrop_address, nft_contract)
+        if not fee_recipient:
+            log.warning(f"⚠️ لا يوجد عنوان رسوم، نحاول باستخدام عنوان افتراضي")
+            fee_recipient = seadrop_address
+        
+        # بناء المعاملة
+        tx = contract.functions.mintPublic(
+            Web3.to_checksum_address(nft_contract),
+            Web3.to_checksum_address(fee_recipient),
+            Web3.to_checksum_address(ZERO_ADDRESS),
+            quantity,
+        ).build_transaction({
+            "from": Web3.to_checksum_address(wallet_address),
+            "value": total_value,
+            "nonce": current_nonce,
+            "gasPrice": current_gas_price,
+            "chainId": w3.eth.chain_id,
+        })
+
+        # تقدير الغاز
+        try:
+            estimated_gas = w3.eth.estimate_gas(tx)
+            tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
+            log.info(f"⛽ الغاز المقدر: {estimated_gas}, مع الهامش: {tx['gas']}")
+        except Exception as e:
+            log.error(f"⚠️ فشل estimate_gas: {e}")
+            return {"success": False, "reason": "simulation_failed", "error": str(e)}
+
+        # التوقيع والإرسال
+        signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
+        raw_tx = getattr(signed_tx, 'raw_transaction', None)
+        if raw_tx is None:
+            raw_tx = getattr(signed_tx, 'rawTransaction', None)
+        if raw_tx is None:
+            raise ValueError("raw_transaction غير موجود")
+            
+        tx_hash = w3.eth.send_raw_transaction(raw_tx)
+        
+        # حساب رسوم الغاز الفعلية
+        gas_used = tx.get("gas", 0)
+        gas_fee_eth = (gas_used * current_gas_price) / 1e18
+        gas_fee_usd = gas_fee_eth * eth_price_usd
+
+        log.info(f"✅ [شراء ناجح] {tx_hash.hex()} — كمية: {quantity}")
+        return {
+            "success": True,
+            "tx_hash": tx_hash.hex(),
+            "quantity": quantity,
+            "gas_fee_usd": gas_fee_usd,
+            "total_value_wei": total_value,
+            "balance_usd": balance_usd,
+        }
+
+    except Exception as e:
+        error_msg = str(e).lower()
+        log.error(f"❌ [خطأ إرسال] {e}")
+        
+        # تحليل سبب الخطأ
+        if "insufficient funds" in error_msg:
+            reason = "insufficient_funds_for_total_cost"
+            log.warning(f"⚠️ رصيد غير كافٍ: ${balance_usd:.4f}")
+        elif "gas" in error_msg:
+            reason = "gas_too_high"
+        else:
+            reason = "tx_error"
+        
+        result = {"success": False, "reason": reason, "error": str(e), "balance_usd": balance_usd}
+        if signed_tx is not None:
+            try:
+                result["tx_hash"] = signed_tx.hash.hex()
+            except Exception:
+                pass
+        return result
+    finally:
+        wallet_lock.release()
