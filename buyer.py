@@ -211,8 +211,8 @@ def get_fee_recipient(w3: Web3, seadrop_address: str, nft_contract: str) -> str 
 def decide_quantity(max_per_wallet: int | None, remaining_supply: int) -> int:
     """
     تحدد الكمية المناسبة للشراء بناءً على:
-    - max_per_wallet <= 20  => اشترِ الحد الأقصى المسموح
-    - max_per_wallet > 20   => اشترِ 5 فقط (تفادي مينتات ذات كمية ضخمة)
+    - max_per_wallet <= 5  => اشترِ الحد الأقصى المسموح
+    - max_per_wallet > 5  => اشترِ 5 فقط (تفادي مينتات ذات كمية ضخمة)
     - max_per_wallet مجهول  => اشترِ قطعة واحدة فقط (أمان)
     
     المعاملات:
