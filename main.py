@@ -26,6 +26,7 @@ from buyer import (
     MIN_BALANCE_RESERVE_USD,
     MAX_GAS_FEE_USD,
     get_wallet_balance_usd,
+    get_all_wallets_balances,
 )
 
 log = logging.getLogger(__name__)
@@ -276,7 +277,7 @@ def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
     return price_usd < FREE_PRICE_THRESHOLD_USD
 
 # ===================================================================
-# نظام إشعارات تيليجرام - مُحسّن
+# نظام إشعارات تيليجرام - مُحسّن مع عرض الرصيد
 # ===================================================================
 send_queue: asyncio.Queue[str] = asyncio.Queue()
 
@@ -303,7 +304,6 @@ async def send_telegram_message(session: aiohttp.ClientSession, text: str) -> bo
         return False
     
     try:
-        # تقسيم الرسائل الطويلة
         if len(text) > 4000:
             parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
             for part in parts:
@@ -337,10 +337,8 @@ async def telegram_sender():
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                # انتظار رسالة جديدة في الطابور
                 text = await send_queue.get()
                 
-                # محاولة إرسال الرسالة مع إعادة محاولة
                 success = False
                 for attempt in range(3):
                     success = await send_telegram_message(session, text)
@@ -361,7 +359,51 @@ async def telegram_sender():
                 logging.error(traceback.format_exc())
             finally:
                 send_queue.task_done()
-                await asyncio.sleep(1.0)  # تأخير بين الرسائل
+                await asyncio.sleep(1.0)
+
+# ===================================================================
+# بناء رسالة عرض الرصيد لجميع المحافظ
+# ===================================================================
+def build_balances_message(balances: dict, eth_price_usd: float) -> str:
+    """
+    بناء رسالة تعرض رصيد كل محفظة لكل سلسلة.
+    
+    المعاملات:
+        balances: dict - رصيد كل محفظة لكل سلسلة
+        eth_price_usd: float - سعر ETH الحالي
+    
+    المخرجات:
+        str - رسالة منسقة بتنسيق HTML
+    """
+    if not balances:
+        return "⚠️ لا توجد بيانات رصيد متاحة"
+    
+    msg_lines = []
+    msg_lines.append("💰 <b>رصيد المحافظ</b>")
+    msg_lines.append(f"📊 سعر ETH: ${eth_price_usd:.2f}\n")
+    
+    for wallet_name, chain_balances in balances.items():
+        msg_lines.append(f"👛 <b>{wallet_name}</b>")
+        for chain_name, balance in chain_balances.items():
+            chain_display = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
+            status = "✅" if balance >= MIN_BALANCE_RESERVE_USD else "⚠️"
+            msg_lines.append(f"  {status} {chain_display}: ${balance:.4f}")
+        msg_lines.append("")  # سطر فارغ
+    
+    return "\n".join(msg_lines)
+
+
+async def send_balances_report(session: aiohttp.ClientSession):
+    """إرسال تقرير رصيد جميع المحافظ إلى تيليجرام."""
+    if not w3_instances or not WALLETS:
+        return
+    
+    eth_price_usd = await get_eth_price_usd(session)
+    balances = get_all_wallets_balances(w3_instances, WALLETS, eth_price_usd)
+    
+    msg = build_balances_message(balances, eth_price_usd)
+    enqueue_message(msg)
+    logging.info("📊 تم إرسال تقرير الرصيد")
 
 # ===================================================================
 # رسائل أسباب الفشل
@@ -426,6 +468,7 @@ def build_result_message(detail: dict, result: dict, chain_name: str, wallet_nam
             f"👛 المحفظة: {wallet_name}\n"
             f"📊 الكمية: {result.get('quantity', 0)}\n"
             f"⛽ رسوم الغاز: ${result.get('gas_fee_usd', 0):.4f}\n"
+            f"💵 رصيد المحفظة: ${result.get('balance_usd', 0):.4f}\n"
             f"🔗 معاملة: {result.get('tx_hash', '')}\n"
             f"🔗 {url}"
         )
@@ -578,7 +621,6 @@ async def retry_purchase(session: aiohttp.ClientSession, tracker: RetryTracker):
     )
     result["eth_price_usd"] = eth_price_usd
     
-    # إرسال إشعار
     msg = build_result_message(detail, result, tracker.chain_name, tracker.wallet_name)
     enqueue_message(msg)
 
@@ -692,7 +734,6 @@ async def evaluate_and_buy(
             known_external.add(slug)
             return
 
-        # إرسال معلومات المينت
         info_msg = build_mint_info_message(detail, eth_price_usd, actual_chain)
         enqueue_message(info_msg)
 
@@ -749,7 +790,6 @@ async def evaluate_and_buy(
                     "chain": actual_chain,
                 }
                 
-                # إرسال إشعار الفشل
                 msg = build_result_message(detail, result, actual_chain, wallet_name)
                 enqueue_message(msg)
                 
@@ -961,7 +1001,6 @@ async def scan_active_drops(notified: set, known_external: set, checking: set):
             try:
                 all_drops = []
                 
-                # جلب المينتات من كلتا السلسلتين
                 for chain_name in ENABLED_CHAINS:
                     url = f"{DROPS_API_BASE}?is_minting=true&limit=50"
                     headers = {"x-api-key": OPENSEA_API_KEY}
@@ -1012,17 +1051,6 @@ async def scan_active_drops(notified: set, known_external: set, checking: set):
 # التشغيل الرئيسي
 # ===================================================================
 async def run():
-    # إرسال رسالة بدء التشغيل
-    startup_msg = "🚀 <b>نظام الشراء التلقائي يعمل الآن!</b>\n\n"
-    startup_msg += f"📡 السلاسل النشطة: {', '.join([CHAINS_CONFIG[c]['chain_name_display'] for c in ENABLED_CHAINS]) if ENABLED_CHAINS else 'لا توجد'}\n"
-    startup_msg += f"👛 المحافظ النشطة: {len(WALLETS)}\n"
-    startup_msg += f"🔢 الحد الأقصى للمجموعات المتزامنة: {MAX_CONCURRENT_MINTS}\n"
-    startup_msg += f"🔄 نظام إعادة المحاولة: نشط لمدة {MAX_RETRY_HOURS} ساعات\n"
-    startup_msg += f"💡 الرصيد يُفحص لكل سلسلة بشكل منفصل"
-    
-    enqueue_message(startup_msg)
-    logging.info("🚀 بدء تشغيل النظام...")
-
     if not BOT_ENABLED:
         logging.warning("🔴 BOT_ENABLED=false — النظام متوقف عمدًا (وضع الأمان).")
         enqueue_message("🔴 البوت شغّال لكن بوضع الإيقاف (BOT_ENABLED=false)")
@@ -1039,11 +1067,25 @@ async def run():
         logging.warning("⚠️ متغيرات تيليجرام غير مكتملة! لن يتم إرسال الإشعارات.")
         enqueue_message("⚠️ متغيرات تيليجرام غير مكتملة! لن يتم إرسال الإشعارات.")
 
+    # إرسال رسالة بدء التشغيل
+    startup_msg = "🚀 <b>نظام الشراء التلقائي يعمل الآن!</b>\n\n"
+    startup_msg += f"📡 السلاسل النشطة: {', '.join([CHAINS_CONFIG[c]['chain_name_display'] for c in ENABLED_CHAINS]) if ENABLED_CHAINS else 'لا توجد'}\n"
+    startup_msg += f"👛 المحافظ النشطة: {len(WALLETS)}\n"
+    startup_msg += f"🔢 الحد الأقصى للمجموعات المتزامنة: {MAX_CONCURRENT_MINTS}\n"
+    startup_msg += f"🔄 نظام إعادة المحاولة: نشط لمدة {MAX_RETRY_HOURS} ساعات\n"
+    startup_msg += f"💡 الرصيد يُفحص لكل سلسلة بشكل منفصل"
+    enqueue_message(startup_msg)
+    
+    # إرسال تقرير الرصيد الأولي
+    async with aiohttp.ClientSession() as session:
+        await send_balances_report(session)
+    
+    logging.info("🚀 بدء تشغيل النظام...")
+
     notified: set[str] = set()
     known_external: set[str] = set()
     checking: set[str] = set()
 
-    # تشغيل المهام
     await asyncio.gather(
         listen_opensea(notified, known_external, checking),
         scan_active_drops(notified, known_external, checking),
