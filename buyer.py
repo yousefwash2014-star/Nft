@@ -1,7 +1,5 @@
 """
 محرك الشراء التلقائي مع نظام عرض الرموز في السوق
-عرض جميع الرموز المملوكة - إعادة المحاولة للفاشلة كل 30 دقيقة
-إعادة عرض الناجحة كل 4 ساعات - حد أقصى 50 رمز لكل عملية
 """
 
 import logging
@@ -19,15 +17,15 @@ log = logging.getLogger("buyer")
 # ===========================================================================
 # إعدادات نظام عرض الرموز
 # ===========================================================================
-MAX_LISTING_PRICE_USD = 0.0001  # 0.01 سنت كحد أقصى
-MIN_LISTING_PRICE_USD = 0.00001  # 0.001 سنت كحد أدنى
-LISTING_RETRY_INTERVAL = 1800  # 30 دقيقة للرموز الفاشلة
-LISTING_RELIST_INTERVAL = 14400  # 4 ساعات لإعادة عرض الرموز الناجحة
-MAX_LISTING_RETRIES = 5  # عدد محاولات إعادة العرض للفاشلة
+MAX_LISTING_PRICE_USD = 0.0001
+MIN_LISTING_PRICE_USD = 0.00001
+LISTING_RETRY_INTERVAL = 1800
+LISTING_RELIST_INTERVAL = 14400
+MAX_LISTING_RETRIES = 5
 LISTING_GAS_LIMIT = 300000
-MAX_TOKENS_PER_LISTING_BATCH = 50  # حد أقصى 50 رمز لكل عملية عرض
-BATCH_DELAY_BETWEEN_TOKENS = 1  # تأخير ثانية بين كل رمز
-BATCH_DELAY_BETWEEN_BATCHES = 60  # تأخير دقيقة بين كل دفعة
+MAX_TOKENS_PER_LISTING_BATCH = 50
+BATCH_DELAY_BETWEEN_TOKENS = 1
+BATCH_DELAY_BETWEEN_BATCHES = 60
 
 # ===========================================================================
 # إعدادات الشراء
@@ -48,46 +46,35 @@ GAS_LIMIT_SAFETY_MARGIN = 1.05
 FREE_PRICE_THRESHOLD_WEI = 1000
 
 # ===========================================================================
-# أسباب إعادة المحاولة (محددة هنا لضمان التصدير)
+# أسباب إعادة المحاولة
 # ===========================================================================
 RETRYABLE_REASONS = {
-    "gas_too_high",
-    "simulation_failed",
-    "tx_error",
-    "no_fee_recipient",
-    "nonce_error",
-    "insufficient_funds",
-    "tx_pending",
-    "listing_error",
-    "gas_error",
-    "listing_reverted"
+    "gas_too_high", "simulation_failed", "tx_error", "no_fee_recipient",
+    "nonce_error", "insufficient_funds", "tx_pending", "listing_error",
+    "gas_error", "listing_reverted"
 }
 
 PERMANENT_REASONS = {
-    "not_free_mint",
-    "not_eligible",
-    "wallet_limit_reached",
-    "balance_too_low",
-    "tx_value_too_high",
-    "sold_out"
+    "not_free_mint", "not_eligible", "wallet_limit_reached",
+    "balance_too_low", "tx_value_too_high", "sold_out"
 }
 
 REASON_MESSAGES_AR = {
     "balance_too_low": "الرصيد منخفض جداً",
-    "gas_too_high": "رسوم الغاز مرتفعة (أكثر من 15 سنت)",
+    "gas_too_high": "رسوم الغاز مرتفعة",
     "tx_value_too_high": "قيمة المعاملة عالية",
     "no_fee_recipient": "لا يوجد عنوان رسوم متاح",
     "simulation_failed": "فشلت محاكاة المعاملة",
     "not_free_mint": "المينت مدفوع وليس مجاني",
     "tx_error": "خطأ في الشبكة",
-    "nonce_error": "خطأ في رقم المعاملة (nonce)",
-    "insufficient_funds": "الرصيد غير كاف للشراء",
+    "nonce_error": "خطأ في رقم المعاملة",
+    "insufficient_funds": "الرصيد غير كاف",
     "sold_out": "نفذت الكمية",
-    "not_eligible": "المحفظة غير مؤهلة للشراء",
-    "tx_reverted": "المعاملة فشلت على البلوكشين",
+    "not_eligible": "المحفظة غير مؤهلة",
+    "tx_reverted": "المعاملة فشلت",
     "tx_pending": "المعاملة قيد التأكيد",
     "wallet_limit_reached": "وصلت للحد الأقصى",
-    "listing_error": "فشل عرض الرمز في السوق",
+    "listing_error": "فشل عرض الرمز",
     "listing_reverted": "فشلت معاملة العرض",
     "gas_error": "خطأ في الغاز",
     "unknown": "خطأ غير معروف",
@@ -120,7 +107,7 @@ CHAINS_CONFIG = {
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
 # ===========================================================================
-# ABI للعقود
+# ABI
 # ===========================================================================
 SEADROP_ABI = [
     {
@@ -144,7 +131,6 @@ SEADROP_ABI = [
     },
 ]
 
-# ABI للسوق (Marketplace)
 MARKETPLACE_ABI = [
     {
         "inputs": [
@@ -172,36 +158,8 @@ MARKETPLACE_ABI = [
         "type": "function",
     },
     {
-        "inputs": [
-            {"name": "nftContract", "type": "address"},
-            {"name": "tokenId", "type": "uint256"},
-            {"name": "newPrice", "type": "uint256"},
-        ],
-        "name": "updateListing",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
-    {
-        "inputs": [
-            {"name": "nftContract", "type": "address"},
-            {"name": "tokenId", "type": "uint256"},
-        ],
-        "name": "cancelListing",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
-    {
         "inputs": [],
         "name": "getListingFee",
-        "outputs": [{"name": "", "type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [],
-        "name": "getMarketplaceFee",
         "outputs": [{"name": "", "type": "uint256"}],
         "stateMutability": "view",
         "type": "function",
@@ -213,41 +171,8 @@ MARKETPLACE_ABI = [
         "stateMutability": "view",
         "type": "function",
     },
-    {
-        "inputs": [
-            {"name": "nftContract", "type": "address"},
-            {"name": "tokenId", "type": "uint256"},
-        ],
-        "name": "getListingFeeForToken",
-        "outputs": [{"name": "", "type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [{"name": "nftContract", "type": "address"}],
-        "name": "getAllListings",
-        "outputs": [
-            {"name": "tokenIds", "type": "uint256[]"},
-            {"name": "prices", "type": "uint256[]"},
-            {"name": "sellers", "type": "address[]"},
-        ],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [{"name": "nftContract", "type": "address"}],
-        "name": "getActiveListings",
-        "outputs": [
-            {"name": "tokenIds", "type": "uint256[]"},
-            {"name": "prices", "type": "uint256[]"},
-            {"name": "sellers", "type": "address[]"},
-        ],
-        "stateMutability": "view",
-        "type": "function",
-    },
 ]
 
-# ABI للـ NFT (ERC721)
 ERC721_ABI = [
     {
         "inputs": [{"name": "owner", "type": "address"}],
@@ -264,33 +189,8 @@ ERC721_ABI = [
         "type": "function",
     },
     {
-        "inputs": [
-            {"name": "from", "type": "address"},
-            {"name": "to", "type": "address"},
-            {"name": "tokenId", "type": "uint256"},
-        ],
-        "name": "safeTransferFrom",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
-    {
         "inputs": [{"name": "owner", "type": "address"}],
         "name": "tokensOfOwner",
-        "outputs": [{"name": "", "type": "uint256[]"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [{"name": "owner", "type": "address"}],
-        "name": "getTokensOfOwner",
-        "outputs": [{"name": "", "type": "uint256[]"}],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [{"name": "owner", "type": "address"}],
-        "name": "walletOfOwner",
         "outputs": [{"name": "", "type": "uint256[]"}],
         "stateMutability": "view",
         "type": "function",
@@ -341,7 +241,6 @@ class MintResult:
 
 @dataclass
 class NFTListing:
-    """بيانات عرض رمز في السوق."""
     token_id: str
     nft_contract: str
     wallet_address: str
@@ -355,7 +254,7 @@ class NFTListing:
     relist_attempts: int = 0
     last_try: float = field(default_factory=time.time)
     last_success: float = 0
-    status: str = "pending"  # pending, listed, failed, retrying, relisting
+    status: str = "pending"
     error: str = ""
     tx_hash: str = ""
     created_at: float = field(default_factory=time.time)
@@ -495,9 +394,6 @@ def calculate_retry_delay(config: RetryConfig, attempt_count: int) -> float:
         delay *= random.uniform(0.75, 1.25)
     return delay
 
-# ===========================================================================
-# دوال استخراج المراحل
-# ===========================================================================
 def extract_all_stages_raw(detail: dict) -> list:
     all_stages = []
     if detail.get("active_stage"):
@@ -553,19 +449,15 @@ def find_all_free_stages(detail: dict, wallets=None) -> dict:
     return result
 
 # ===========================================================================
-# دوال عرض الرموز في السوق
+# إدارة عروض الرموز
 # ===========================================================================
 class ListingManager:
-    """إدارة عرض الرموز في السوق."""
-    
     def __init__(self):
         self.listings: Dict[str, NFTListing] = {}
         self.lock = threading.Lock()
         self._listed_tokens: Set[str] = set()
         self._failed_tokens: Set[str] = set()
         self._pending_tokens: Set[str] = set()
-        self._relist_tokens: Set[str] = set()
-        self._active_batch: List[str] = []
         self._total_tokens_processed = 0
     
     def add_listing(self, token_id: str, nft_contract: str, wallet_address: str,
@@ -610,7 +502,6 @@ class ListingManager:
             for token_id, data in self.listings.items():
                 if count >= limit:
                     break
-                    
                 if data.status in ("pending", "retrying"):
                     if data.attempts < MAX_LISTING_RETRIES:
                         if now - data.last_try >= LISTING_RETRY_INTERVAL or data.status == "pending":
@@ -618,44 +509,6 @@ class ListingManager:
                             count += 1
             
             return pending
-    
-    def get_all_tokens_for_listing(self) -> List[NFTListing]:
-        with self.lock:
-            now = time.time()
-            result = []
-            
-            for token_id, data in self.listings.items():
-                if data.status == "pending":
-                    result.append(data)
-            
-            for token_id, data in self.listings.items():
-                if data.status == "retrying":
-                    if data.attempts < MAX_LISTING_RETRIES:
-                        if now - data.last_try >= LISTING_RETRY_INTERVAL:
-                            result.append(data)
-            
-            for token_id, data in self.listings.items():
-                if data.status == "listed":
-                    if data.last_success > 0:
-                        if now - data.last_success >= LISTING_RELIST_INTERVAL:
-                            data.status = "relisting"
-                            result.append(data)
-            
-            return result
-    
-    def get_next_batch(self, limit: int = MAX_TOKENS_PER_LISTING_BATCH) -> List[NFTListing]:
-        all_tokens = self.get_all_tokens_for_listing()
-        priority_order = {"pending": 0, "retrying": 1, "relisting": 2, "listed": 3}
-        sorted_tokens = sorted(all_tokens, key=lambda x: priority_order.get(x.status, 4))
-        return sorted_tokens[:limit]
-    
-    def get_failed_tokens(self) -> List[NFTListing]:
-        with self.lock:
-            return [data for data in self.listings.values() if data.status == "failed"]
-    
-    def get_listed_tokens(self) -> List[NFTListing]:
-        with self.lock:
-            return [data for data in self.listings.values() if data.status == "listed"]
     
     def has_pending_listings(self) -> bool:
         with self.lock:
@@ -686,9 +539,6 @@ class ListingManager:
                 self._listed_tokens.add(listing_key)
                 self._pending_tokens.discard(listing_key)
                 self._failed_tokens.discard(listing_key)
-                
-                if token_id in self._active_batch:
-                    self._active_batch.remove(token_id)
     
     def mark_failed(self, token_id: str, error: str) -> None:
         with self.lock:
@@ -698,9 +548,6 @@ class ListingManager:
                 data.last_try = time.time()
                 data.error = error
                 listing_key = f"{token_id}:{data.nft_contract}:{data.wallet_address}"
-                
-                if token_id in self._active_batch:
-                    self._active_batch.remove(token_id)
                 
                 if data.attempts >= MAX_LISTING_RETRIES:
                     data.status = "failed"
@@ -717,7 +564,6 @@ class ListingManager:
             failed = sum(1 for d in self.listings.values() if d.status == "failed")
             pending = sum(1 for d in self.listings.values() if d.status == "pending")
             retrying = sum(1 for d in self.listings.values() if d.status == "retrying")
-            relisting = sum(1 for d in self.listings.values() if d.status == "relisting")
             
             return {
                 "total": total,
@@ -725,28 +571,18 @@ class ListingManager:
                 "failed": failed,
                 "pending": pending,
                 "retrying": retrying,
-                "relisting": relisting,
                 "max_per_batch": MAX_TOKENS_PER_LISTING_BATCH,
-                "retry_interval_minutes": LISTING_RETRY_INTERVAL // 60,
-                "relist_interval_hours": LISTING_RELIST_INTERVAL // 3600,
             }
 
 # ===========================================================================
-# دوال استخراج رسوم العرض
+# دوال عرض الرموز في السوق
 # ===========================================================================
 def get_listing_fees(
     w3: Web3,
     marketplace_address: str,
     nft_contract: Optional[str] = None,
-    token_id: Optional[int] = None,
 ) -> Dict[str, int]:
-    result = {
-        "listing_fee": 0,
-        "marketplace_fee": 0,
-        "collection_fee": 0,
-        "token_fee": 0,
-        "total_fee": 0,
-    }
+    result = {"listing_fee": 0, "marketplace_fee": 0, "collection_fee": 0, "total_fee": 0}
     
     try:
         marketplace = w3.eth.contract(
@@ -772,33 +608,11 @@ def get_listing_fees(
             except:
                 pass
         
-        if nft_contract and token_id is not None:
-            try:
-                result["token_fee"] = marketplace.functions.getListingFeeForToken(
-                    Web3.to_checksum_address(nft_contract),
-                    token_id
-                ).call()
-            except:
-                pass
-        
-        result["total_fee"] = (
-            result["listing_fee"] +
-            result["marketplace_fee"] +
-            result["collection_fee"] +
-            result["token_fee"]
-        )
-        
+        result["total_fee"] = result["listing_fee"] + result["marketplace_fee"] + result["collection_fee"]
         return result
-        
     except Exception as e:
         log.warning(f"⚠️ فشل استخراج رسوم العرض: {e}")
         return result
-
-def get_listing_fee_eth(fees: Dict[str, int]) -> float:
-    return fees.get("total_fee", 0) / 1e18
-
-def get_listing_fee_usd(fees: Dict[str, int], eth_price_usd: float) -> float:
-    return (fees.get("total_fee", 0) / 1e18) * eth_price_usd
 
 def calculate_listing_price(
     eth_price_usd: float,
@@ -825,53 +639,25 @@ def calculate_listing_price(
     
     return final_wei, final_usd, fees
 
-# ===========================================================================
-# دوال الحصول على الرموز المملوكة
-# ===========================================================================
-def get_nft_balance(
-    w3: Web3,
-    nft_contract: str,
-    wallet_address: str,
-) -> int:
+def get_nft_balance(w3: Web3, nft_contract: str, wallet_address: str) -> int:
     try:
         contract = w3.eth.contract(
             address=Web3.to_checksum_address(nft_contract),
             abi=ERC721_ABI
         )
-        return contract.functions.balanceOf(
-            Web3.to_checksum_address(wallet_address)
-        ).call()
+        return contract.functions.balanceOf(Web3.to_checksum_address(wallet_address)).call()
     except:
         return 0
 
-def get_tokens_of_owner(
-    w3: Web3,
-    nft_contract: str,
-    wallet_address: str,
-) -> List[int]:
-    contract = w3.eth.contract(
-        address=Web3.to_checksum_address(nft_contract),
-        abi=ERC721_ABI
-    )
-    
-    wallet = Web3.to_checksum_address(wallet_address)
-    
+def get_tokens_of_owner(w3: Web3, nft_contract: str, wallet_address: str) -> List[int]:
     try:
-        return contract.functions.tokensOfOwner(wallet).call()
+        contract = w3.eth.contract(
+            address=Web3.to_checksum_address(nft_contract),
+            abi=ERC721_ABI
+        )
+        return contract.functions.tokensOfOwner(Web3.to_checksum_address(wallet_address)).call()
     except:
-        pass
-    
-    try:
-        return contract.functions.getTokensOfOwner(wallet).call()
-    except:
-        pass
-    
-    try:
-        return contract.functions.walletOfOwner(wallet).call()
-    except:
-        pass
-    
-    return []
+        return []
 
 def get_all_owned_tokens(
     w3: Web3,
@@ -897,9 +683,6 @@ def get_all_owned_tokens(
     
     return tokens
 
-# ===========================================================================
-# دوال عرض الرموز في السوق (التنفيذ)
-# ===========================================================================
 def create_listing_tx(
     w3: Web3,
     nft_contract: str,
@@ -919,10 +702,7 @@ def create_listing_tx(
         price_wei,
     ).build_transaction({
         "from": Web3.to_checksum_address(wallet_address),
-        "nonce": w3.eth.get_transaction_count(
-            Web3.to_checksum_address(wallet_address),
-            "pending"
-        ),
+        "nonce": w3.eth.get_transaction_count(Web3.to_checksum_address(wallet_address), "pending"),
         "gasPrice": w3.eth.gas_price,
         "chainId": w3.eth.chain_id,
     })
@@ -956,9 +736,7 @@ def attempt_listing(
             tx["gas"] = LISTING_GAS_LIMIT
         
         signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
-        raw_tx = getattr(signed_tx, 'raw_transaction', None)
-        if raw_tx is None:
-            raw_tx = getattr(signed_tx, 'rawTransaction', None)
+        raw_tx = signed_tx.rawTransaction if hasattr(signed_tx, 'rawTransaction') else signed_tx.raw_transaction
         
         if raw_tx is None:
             raise ValueError("raw_transaction غير موجود")
@@ -969,23 +747,17 @@ def attempt_listing(
         try:
             receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=30)
             if receipt and receipt.status == 1:
-                return {
-                    "success": True,
-                    "tx_hash": tx_hash_str,
-                    "gas_used": receipt.gasUsed,
-                }
+                log.info(f"✅ تم عرض الرمز {token_id} في السوق")
+                return {"success": True, "tx_hash": tx_hash_str, "gas_used": receipt.gasUsed}
             else:
                 return {"success": False, "reason": "listing_reverted"}
-        except:
-            return {
-                "success": True,
-                "tx_hash": tx_hash_str,
-                "gas_used": tx.get("gas", 0),
-                "pending": True,
-            }
+        except Exception as e:
+            log.info(f"✅ تم إرسال معاملة عرض الرمز {token_id}")
+            return {"success": True, "tx_hash": tx_hash_str, "gas_used": tx.get("gas", 0), "pending": True}
             
     except Exception as e:
         error_msg = str(e).lower()
+        log.error(f"❌ فشل عرض الرمز: {e}")
         
         if "insufficient funds" in error_msg:
             return {"success": False, "reason": "insufficient_funds"}
@@ -998,9 +770,9 @@ def attempt_listing(
     finally:
         wallet_lock.release()
 
-# ===========================================================================
-# دوال العرض الرئيسية
-# ===========================================================================
+# ===================================================================
+# دالة عرض جميع الرموز المملوكة (الرئيسية)
+# ===================================================================
 def list_all_owned_tokens(
     w3: Web3,
     private_key: str,
@@ -1013,6 +785,9 @@ def list_all_owned_tokens(
     known_token_ids: Optional[List[str]] = None,
     listing_manager: Optional[ListingManager] = None,
 ) -> Dict:
+    """
+    عرض جميع الرموز المملوكة للمحفظة في السوق.
+    """
     results = {
         "total_owned": 0,
         "total_listed": 0,
@@ -1020,85 +795,63 @@ def list_all_owned_tokens(
         "details": [],
     }
     
-    token_ids = get_all_owned_tokens(
-        w3, nft_contract, wallet_address, known_token_ids
-    )
+    log.info(f"📋 بدء عرض الرموز للمحفظة {wallet_name} على {chain_name}")
+    
+    # الحصول على الرموز المملوكة
+    token_ids = get_all_owned_tokens(w3, nft_contract, wallet_address, known_token_ids)
     
     if not token_ids:
+        log.info(f"ℹ️ لا توجد رموز مملوكة للمحفظة {wallet_name}")
         return results
     
     results["total_owned"] = len(token_ids)
+    log.info(f"📋 تم العثور على {len(token_ids)} رمز مملوك")
     
+    # استخراج رسوم العرض
     fees = get_listing_fees(w3, marketplace_address, nft_contract)
-    price_wei, price_usd, fees = calculate_listing_price(
-        eth_price_usd, 0, fees
-    )
+    price_wei, price_usd, fees = calculate_listing_price(eth_price_usd, 0, fees)
+    log.info(f"💰 سعر العرض: ${price_usd:.6f}")
     
+    # عرض كل رمز
     for token_id in token_ids:
         try:
-            if listing_manager:
-                added = listing_manager.add_listing(
-                    token_id=str(token_id),
-                    nft_contract=nft_contract,
-                    wallet_address=wallet_address,
-                    wallet_name=wallet_name,
-                    price_wei=price_wei,
-                    price_usd=price_usd,
-                    chain_name=chain_name,
-                )
-                
-                if added:
-                    result = attempt_listing(
-                        w3=w3,
-                        private_key=private_key,
-                        wallet_address=wallet_address,
-                        nft_contract=nft_contract,
-                        token_id=token_id,
-                        price_wei=price_wei,
-                        marketplace_address=marketplace_address,
-                        chain_name=chain_name,
-                    )
-                    
-                    if result.get("success"):
-                        listing_manager.mark_success(str(token_id), result.get("tx_hash", ""))
-                        results["total_listed"] += 1
-                    else:
-                        listing_manager.mark_failed(str(token_id), result.get("reason", "unknown"))
-                        results["total_failed"] += 1
-                    
-                    results["details"].append({
-                        "token_id": str(token_id),
-                        "success": result.get("success", False),
-                        "tx_hash": result.get("tx_hash", ""),
-                        "reason": result.get("reason", ""),
-                    })
-                    
-                    time.sleep(BATCH_DELAY_BETWEEN_TOKENS)
+            log.info(f"🔄 جاري عرض الرمز {token_id}")
+            
+            # محاولة العرض
+            result = attempt_listing(
+                w3=w3,
+                private_key=private_key,
+                wallet_address=wallet_address,
+                nft_contract=nft_contract,
+                token_id=token_id,
+                price_wei=price_wei,
+                marketplace_address=marketplace_address,
+                chain_name=chain_name,
+            )
+            
+            success = result.get("success", False)
+            
+            if success:
+                results["total_listed"] += 1
+                if listing_manager:
+                    listing_manager.mark_success(str(token_id), result.get("tx_hash", ""))
+                log.info(f"✅ تم عرض الرمز {token_id} بنجاح")
             else:
-                result = attempt_listing(
-                    w3=w3,
-                    private_key=private_key,
-                    wallet_address=wallet_address,
-                    nft_contract=nft_contract,
-                    token_id=token_id,
-                    price_wei=price_wei,
-                    marketplace_address=marketplace_address,
-                    chain_name=chain_name,
-                )
-                
-                if result.get("success"):
-                    results["total_listed"] += 1
-                else:
-                    results["total_failed"] += 1
-                
-                results["details"].append({
-                    "token_id": str(token_id),
-                    "success": result.get("success", False),
-                    "tx_hash": result.get("tx_hash", ""),
-                    "reason": result.get("reason", ""),
-                })
-                
-                time.sleep(BATCH_DELAY_BETWEEN_TOKENS)
+                results["total_failed"] += 1
+                reason = result.get("reason", "unknown")
+                if listing_manager:
+                    listing_manager.mark_failed(str(token_id), reason)
+                log.warning(f"❌ فشل عرض الرمز {token_id}: {reason}")
+            
+            results["details"].append({
+                "token_id": str(token_id),
+                "success": success,
+                "tx_hash": result.get("tx_hash", ""),
+                "reason": result.get("reason", ""),
+            })
+            
+            # تأخير بين العروض
+            time.sleep(BATCH_DELAY_BETWEEN_TOKENS)
             
         except Exception as e:
             log.error(f"❌ فشل عرض الرمز {token_id}: {e}")
@@ -1108,9 +861,15 @@ def list_all_owned_tokens(
                 "success": False,
                 "reason": str(e),
             })
+            if listing_manager:
+                listing_manager.mark_failed(str(token_id), str(e))
     
+    log.info(f"📊 نتائج العرض: {results['total_listed']} نجاح، {results['total_failed']} فشل")
     return results
 
+# ===================================================================
+# دوال إعادة المحاولة
+# ===================================================================
 def retry_failed_listings(
     listing_manager: ListingManager,
     w3: Web3,
@@ -1139,6 +898,7 @@ def retry_failed_listings(
     if not failed_tokens:
         return results
     
+    log.info(f"🔄 إعادة محاولة عرض {len(failed_tokens)} رمز فاشل")
     results["total_retried"] = len(failed_tokens)
     
     for data in failed_tokens:
@@ -1176,11 +936,6 @@ def retry_failed_listings(
             log.error(f"❌ فشل إعادة محاولة عرض الرمز {data.token_id}: {e}")
             listing_manager.mark_failed(data.token_id, str(e))
             results["total_failed"] += 1
-            results["details"].append({
-                "token_id": data.token_id,
-                "success": False,
-                "reason": str(e),
-            })
     
     return results
 
@@ -1212,6 +967,7 @@ def relist_successful_tokens(
     if not relist_tokens:
         return results
     
+    log.info(f"🔄 إعادة عرض {len(relist_tokens)} رمز ناجح")
     results["total_relisted"] = len(relist_tokens)
     
     for data in relist_tokens:
@@ -1248,17 +1004,12 @@ def relist_successful_tokens(
         except Exception as e:
             log.error(f"❌ فشل إعادة عرض الرمز {data.token_id}: {e}")
             results["total_failed"] += 1
-            results["details"].append({
-                "token_id": data.token_id,
-                "success": False,
-                "reason": str(e),
-            })
     
     return results
 
-# ===========================================================================
+# ===================================================================
 # دوال الشراء
-# ===========================================================================
+# ===================================================================
 def attempt_purchase(
     w3,
     private_key,
@@ -1433,55 +1184,3 @@ def attempt_purchase(
         )
     finally:
         wallet_lock.release()
-
-# ===========================================================================
-# تصدير الدوال والمتغيرات
-# ===========================================================================
-__all__ = [
-    # الثوابت
-    'CHAINS_CONFIG',
-    'SEADROP_ABI',
-    'MARKETPLACE_ABI',
-    'ERC721_ABI',
-    'MAX_GAS_FEE_USD',
-    'MIN_BALANCE_RESERVE_USD',
-    'RETRYABLE_REASONS',
-    'PERMANENT_REASONS',
-    'MAX_LISTING_PRICE_USD',
-    'LISTING_RETRY_INTERVAL',
-    'LISTING_RELIST_INTERVAL',
-    'MAX_LISTING_RETRIES',
-    'MAX_TOKENS_PER_LISTING_BATCH',
-    
-    # دوال أساسية
-    'get_web3_from_config',
-    'get_wallet_balance',
-    'get_fee_recipient',
-    'attempt_purchase',
-    'is_price_free',
-    'find_all_free_stages',
-    'get_retry_config',
-    'calculate_retry_delay',
-    'get_reason_text',
-    'is_reason_retryable',
-    'is_reason_permanent',
-    'parse_stage_time',
-    'MintResult',
-    'RetryConfig',
-    'RetryStrategy',
-    
-    # دوال عرض الرموز
-    'ListingManager',
-    'NFTListing',
-    'list_all_owned_tokens',
-    'retry_failed_listings',
-    'relist_successful_tokens',
-    'get_listing_fees',
-    'calculate_listing_price',
-    'get_listing_fee_eth',
-    'get_listing_fee_usd',
-    'get_nft_balance',
-    'get_tokens_of_owner',
-    'get_all_owned_tokens',
-    'attempt_listing',
-]
