@@ -39,7 +39,7 @@ from buyer import (
     is_reason_retryable,
     is_reason_permanent,
     parse_stage_time,
-    # دوال عرض الرموز الجديدة
+    # دوال عرض الرموز
     ListingManager,
     list_all_owned_tokens,
     retry_failed_listings,
@@ -520,7 +520,6 @@ def build_permanent_msg(wallet_name, reason_text):
 # رسائل عرض الرموز
 # ===================================================================
 def build_listing_summary_msg(results: Dict, chain_name: str, wallet_name: str) -> str:
-    """رسالة ملخص عرض الرموز."""
     cd = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
     
     total = results.get("total_owned", 0)
@@ -538,7 +537,7 @@ def build_listing_summary_msg(results: Dict, chain_name: str, wallet_name: str) 
     
     if results.get("details"):
         lines.append("\nتفاصيل:")
-        for d in results["details"][:10]:  # عرض أول 10 فقط
+        for d in results["details"][:10]:
             status = "✅" if d.get("success") else "❌"
             lines.append(f"  {status} الرمز {d['token_id'][:8]}... - {d.get('reason', 'نجاح')}")
         if len(results["details"]) > 10:
@@ -547,7 +546,6 @@ def build_listing_summary_msg(results: Dict, chain_name: str, wallet_name: str) 
     return "\n".join(lines)
 
 def build_listing_retry_msg(results: Dict, chain_name: str, wallet_name: str) -> str:
-    """رسالة إعادة محاولة عرض الرموز الفاشلة."""
     cd = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
     
     retried = results.get("total_retried", 0)
@@ -564,7 +562,6 @@ def build_listing_retry_msg(results: Dict, chain_name: str, wallet_name: str) ->
     )
 
 def build_relist_msg(results: Dict, chain_name: str, wallet_name: str) -> str:
-    """رسالة إعادة عرض الرموز الناجحة."""
     cd = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
     
     relisted = results.get("total_relisted", 0)
@@ -676,9 +673,7 @@ async def process_wallet(session, slug, detail, stage, cn, wallet, ep, end_time=
             await update_balance(session, wa, cn)
             send_telegram(build_success_msg(detail, result, cn))
             
-            # =============================================================
             # عرض الرموز المملوكة في السوق بعد الشراء الناجح
-            # =============================================================
             await list_owned_tokens(session, wallet, contract, cn)
             
         else:
@@ -811,9 +806,7 @@ async def retry_loop(session, tracker):
 # دوال عرض الرموز في السوق
 # ===================================================================
 async def list_owned_tokens(session, wallet, nft_contract, chain_name):
-    """
-    عرض جميع الرموز المملوكة للمحفظة في السوق.
-    """
+    """عرض جميع الرموز المملوكة للمحفظة في السوق."""
     w3 = w3_instances.get(chain_name)
     if not w3:
         return
@@ -850,9 +843,7 @@ async def list_owned_tokens(session, wallet, nft_contract, chain_name):
         log.error(traceback.format_exc())
 
 async def retry_failed_listings_loop():
-    """
-    دورة دورية لإعادة محاولة عرض الرموز الفاشلة كل 30 دقيقة.
-    """
+    """دورة دورية لإعادة محاولة عرض الرموز الفاشلة كل 30 دقيقة."""
     while True:
         try:
             if listing_manager.has_pending_listings():
@@ -881,7 +872,6 @@ async def retry_failed_listings_loop():
                         if failed_candidates:
                             log.info(f"🔄 إعادة محاولة {len(failed_candidates)} رمز فاشل للمحفظة {wallet['name']} على {chain_name}")
                             
-                            # نبحث عن nft_contract من البيانات المخزنة
                             nft_contract = failed_candidates[0].nft_contract if failed_candidates else None
                             if not nft_contract:
                                 continue
@@ -909,9 +899,7 @@ async def retry_failed_listings_loop():
             await asyncio.sleep(60)
 
 async def relist_successful_tokens_loop():
-    """
-    دورة دورية لإعادة عرض الرموز الناجحة كل 4 ساعات.
-    """
+    """دورة دورية لإعادة عرض الرموز الناجحة كل 4 ساعات."""
     while True:
         try:
             log.info("🔄 بدء دورة إعادة عرض الرموز الناجحة...")
