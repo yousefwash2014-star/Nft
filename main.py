@@ -277,7 +277,7 @@ def is_free_or_negligible(price_wei: int, eth_price_usd: float) -> bool:
     return price_usd < FREE_PRICE_THRESHOLD_USD
 
 # ===================================================================
-# نظام إشعارات تيليجرام - مُحسّن مع عرض الرصيد
+# نظام إشعارات تيليجرام - مُحسّن مع إعادة محاولة قوية
 # ===================================================================
 send_queue: asyncio.Queue[str] = asyncio.Queue()
 
@@ -294,6 +294,51 @@ def enqueue_message(text: str):
     logging.info(f"📤 إضافة رسالة إلى الطابور: {text[:100]}...")
     send_queue.put_nowait(text)
 
+
+async def send_telegram_message_direct(text: str) -> bool:
+    """
+    إرسال رسالة مباشرة إلى تيليجرام (بدون طابور) - للاختبار والرسائل الحرجة.
+    """
+    if not BOT_ENABLED:
+        return False
+    
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logging.error("❌ متغيرات تيليجرام غير مكتملة")
+        return False
+    
+    try:
+        if len(text) > 4000:
+            parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
+            success = True
+            for part in parts:
+                if not await send_telegram_message_direct(part):
+                    success = False
+            return success
+        
+        url = f"{TELEGRAM_API}/sendMessage"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                response_text = await resp.text()
+                if resp.status == 200:
+                    logging.info("✅ تم إرسال رسالة تيليجرام بنجاح (مباشر)")
+                    return True
+                else:
+                    logging.error(f"❌ فشل إرسال تيليجرام: HTTP {resp.status} - {response_text[:200]}")
+                    return False
+    except asyncio.TimeoutError:
+        logging.error("❌ تيليجرام: timeout")
+        return False
+    except Exception as e:
+        logging.error(f"❌ تيليجرام: خطأ غير متوقع: {e}")
+        return False
+
+
 async def send_telegram_message(session: aiohttp.ClientSession, text: str) -> bool:
     """إرسال رسالة واحدة إلى تيليجرام."""
     if not BOT_ENABLED:
@@ -306,9 +351,11 @@ async def send_telegram_message(session: aiohttp.ClientSession, text: str) -> bo
     try:
         if len(text) > 4000:
             parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
+            success = True
             for part in parts:
-                await send_telegram_message(session, part)
-            return True
+                if not await send_telegram_message(session, part):
+                    success = False
+            return success
         
         url = f"{TELEGRAM_API}/sendMessage"
         data = {
@@ -317,7 +364,7 @@ async def send_telegram_message(session: aiohttp.ClientSession, text: str) -> bo
             "parse_mode": "HTML",
         }
         
-        async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=30)) as resp:
             response_text = await resp.text()
             if resp.status == 200:
                 logging.info("✅ تم إرسال رسالة تيليجرام بنجاح")
@@ -332,24 +379,44 @@ async def send_telegram_message(session: aiohttp.ClientSession, text: str) -> bo
         logging.error(f"❌ تيليجرام: خطأ غير متوقع: {e}")
         return False
 
+
 async def telegram_sender():
-    """إرسال الرسائل من الطابور إلى تيليجرام بشكل غير متزامن."""
+    """إرسال الرسائل من الطابور إلى تيليجرام بشكل غير متزامن مع إعادة محاولة قوية."""
+    logging.info("📡 بدء مرسل تيليجرام...")
+    
     async with aiohttp.ClientSession() as session:
         while True:
             try:
-                text = await send_queue.get()
+                # انتظار رسالة جديدة في الطابور (مع timeout لتجنب التجميد)
+                try:
+                    text = await asyncio.wait_for(send_queue.get(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    # لا توجد رسائل، نستمر
+                    continue
                 
+                logging.info(f"📨 جاري إرسال رسالة تيليجرام (طول: {len(text)} حرف)...")
+                
+                # محاولة إرسال الرسالة مع إعادة محاولة
                 success = False
-                for attempt in range(3):
+                for attempt in range(5):  # 5 محاولات
+                    logging.info(f"🔄 محاولة إرسال {attempt + 1}/5")
                     success = await send_telegram_message(session, text)
                     if success:
+                        logging.info("✅ تم إرسال رسالة تيليجرام بنجاح")
                         break
-                    if attempt < 2:
-                        logging.warning(f"🔄 إعادة محاولة إرسال تيليجرام {attempt + 2}/3 بعد 2 ثانية")
-                        await asyncio.sleep(2)
+                    if attempt < 4:
+                        wait_time = (attempt + 1) * 3  # 3, 6, 9, 12 ثانية
+                        logging.warning(f"⚠️ إعادة محاولة إرسال تيليجرام بعد {wait_time} ثانية")
+                        await asyncio.sleep(wait_time)
                 
                 if not success:
-                    logging.error(f"❌ فشل إرسال رسالة تيليجرام بعد 3 محاولات")
+                    logging.error(f"❌ فشل إرسال رسالة تيليجرام بعد 5 محاولات")
+                    # محاولة الإرسال المباشر كحل أخير
+                    logging.info("🔄 محاولة الإرسال المباشر...")
+                    if await send_telegram_message_direct(text):
+                        logging.info("✅ تم إرسال الرسالة عبر الإرسال المباشر")
+                    else:
+                        logging.error("❌ فشل الإرسال المباشر أيضًا")
                     
             except asyncio.CancelledError:
                 logging.info("🛑 تم إيقاف مرسل تيليجرام")
@@ -357,53 +424,34 @@ async def telegram_sender():
             except Exception as e:
                 logging.error(f"❌ خطأ في telegram_sender: {e}")
                 logging.error(traceback.format_exc())
+                await asyncio.sleep(5)
             finally:
-                send_queue.task_done()
-                await asyncio.sleep(1.0)
-
-# ===================================================================
-# بناء رسالة عرض الرصيد لجميع المحافظ
-# ===================================================================
-def build_balances_message(balances: dict, eth_price_usd: float) -> str:
-    """
-    بناء رسالة تعرض رصيد كل محفظة لكل سلسلة.
-    
-    المعاملات:
-        balances: dict - رصيد كل محفظة لكل سلسلة
-        eth_price_usd: float - سعر ETH الحالي
-    
-    المخرجات:
-        str - رسالة منسقة بتنسيق HTML
-    """
-    if not balances:
-        return "⚠️ لا توجد بيانات رصيد متاحة"
-    
-    msg_lines = []
-    msg_lines.append("💰 <b>رصيد المحافظ</b>")
-    msg_lines.append(f"📊 سعر ETH: ${eth_price_usd:.2f}\n")
-    
-    for wallet_name, chain_balances in balances.items():
-        msg_lines.append(f"👛 <b>{wallet_name}</b>")
-        for chain_name, balance in chain_balances.items():
-            chain_display = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
-            status = "✅" if balance >= MIN_BALANCE_RESERVE_USD else "⚠️"
-            msg_lines.append(f"  {status} {chain_display}: ${balance:.4f}")
-        msg_lines.append("")  # سطر فارغ
-    
-    return "\n".join(msg_lines)
+                try:
+                    send_queue.task_done()
+                except ValueError:
+                    pass  # قد تكون المهمة قد تم إكمالها بالفعل
+                
+                await asyncio.sleep(0.5)  # تأخير صغير بين الرسائل
 
 
-async def send_balances_report(session: aiohttp.ClientSession):
-    """إرسال تقرير رصيد جميع المحافظ إلى تيليجرام."""
-    if not w3_instances or not WALLETS:
-        return
+async def send_telegram_test():
+    """إرسال رسالة اختبار لتأكيد عمل تيليجرام."""
+    test_msg = (
+        "🧪 <b>رسالة اختبار من نظام الشراء التلقائي</b>\n\n"
+        f"✅ النظام يعمل بشكل صحيح\n"
+        f"⏰ الوقت: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"🔢 المحافظ النشطة: {len(WALLETS)}\n"
+        f"📡 السلاسل النشطة: {', '.join(ENABLED_CHAINS)}"
+    )
     
-    eth_price_usd = await get_eth_price_usd(session)
-    balances = get_all_wallets_balances(w3_instances, WALLETS, eth_price_usd)
-    
-    msg = build_balances_message(balances, eth_price_usd)
-    enqueue_message(msg)
-    logging.info("📊 تم إرسال تقرير الرصيد")
+    # محاولة الإرسال المباشر أولاً
+    logging.info("🧪 إرسال رسالة اختبار تيليجرام...")
+    result = await send_telegram_message_direct(test_msg)
+    if result:
+        logging.info("✅ تم إرسال رسالة الاختبار بنجاح")
+    else:
+        logging.warning("⚠️ فشل إرسال رسالة الاختبار، سيتم المحاولة عبر الطابور")
+        enqueue_message(test_msg)
 
 # ===================================================================
 # رسائل أسباب الفشل
@@ -558,6 +606,41 @@ def build_mint_info_message(detail: dict, eth_price_usd: float, chain_name: str 
         f"ℹ️ {action_note}\n"
         f"🔗 {url}"
     )
+
+# ===================================================================
+# بناء رسالة عرض الرصيد
+# ===================================================================
+def build_balances_message(balances: dict, eth_price_usd: float) -> str:
+    """بناء رسالة تعرض رصيد كل محفظة لكل سلسلة."""
+    if not balances:
+        return "⚠️ لا توجد بيانات رصيد متاحة"
+    
+    msg_lines = []
+    msg_lines.append("💰 <b>رصيد المحافظ</b>")
+    msg_lines.append(f"📊 سعر ETH: ${eth_price_usd:.2f}\n")
+    
+    for wallet_name, chain_balances in balances.items():
+        msg_lines.append(f"👛 <b>{wallet_name}</b>")
+        for chain_name, balance in chain_balances.items():
+            chain_display = CHAINS_CONFIG.get(chain_name, {}).get("chain_name_display", chain_name)
+            status = "✅" if balance >= MIN_BALANCE_RESERVE_USD else "⚠️"
+            msg_lines.append(f"  {status} {chain_display}: ${balance:.4f}")
+        msg_lines.append("")
+    
+    return "\n".join(msg_lines)
+
+
+async def send_balances_report(session: aiohttp.ClientSession):
+    """إرسال تقرير رصيد جميع المحافظ إلى تيليجرام."""
+    if not w3_instances or not WALLETS:
+        return
+    
+    eth_price_usd = await get_eth_price_usd(session)
+    balances = get_all_wallets_balances(w3_instances, WALLETS, eth_price_usd)
+    
+    msg = build_balances_message(balances, eth_price_usd)
+    enqueue_message(msg)
+    logging.info("📊 تم إرسال تقرير الرصيد إلى الطابور")
 
 # ===================================================================
 # نظام إعادة المحاولة
@@ -1051,21 +1134,30 @@ async def scan_active_drops(notified: set, known_external: set, checking: set):
 # التشغيل الرئيسي
 # ===================================================================
 async def run():
+    logging.info("🚀 بدء تشغيل النظام...")
+    
+    # إرسال رسالة اختبار فورية (مباشرة)
+    logging.info("🧪 إرسال رسالة اختبار تيليجرام...")
+    test_result = await send_telegram_message_direct("🧪 <b>رسالة اختبار من نظام الشراء التلقائي</b>\n\n✅ تم تشغيل النظام بنجاح")
+    if test_result:
+        logging.info("✅ رسالة الاختبار تم إرسالها بنجاح")
+    else:
+        logging.error("❌ فشل إرسال رسالة الاختبار - تحقق من متغيرات TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID")
+
+    # التحقق من المتغيرات
     if not BOT_ENABLED:
         logging.warning("🔴 BOT_ENABLED=false — النظام متوقف عمدًا (وضع الأمان).")
-        enqueue_message("🔴 البوت شغّال لكن بوضع الإيقاف (BOT_ENABLED=false)")
-        await telegram_sender()
+        await send_telegram_message_direct("🔴 البوت شغّال لكن بوضع الإيقاف (BOT_ENABLED=false)")
         return
 
     if not WALLETS:
         logging.critical("🔴 لا توجد محافظ!")
-        enqueue_message("🔴 لا توجد محافظ! تأكد من تعبئة PRIVATE_KEY و WALLET_ADDRESS في ملف .env")
-        await telegram_sender()
+        await send_telegram_message_direct("🔴 لا توجد محافظ! تأكد من تعبئة PRIVATE_KEY و WALLET_ADDRESS في ملف .env")
         return
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.warning("⚠️ متغيرات تيليجرام غير مكتملة! لن يتم إرسال الإشعارات.")
-        enqueue_message("⚠️ متغيرات تيليجرام غير مكتملة! لن يتم إرسال الإشعارات.")
+        await send_telegram_message_direct("⚠️ متغيرات تيليجرام غير مكتملة! لن يتم إرسال الإشعارات.")
 
     # إرسال رسالة بدء التشغيل
     startup_msg = "🚀 <b>نظام الشراء التلقائي يعمل الآن!</b>\n\n"
@@ -1074,22 +1166,25 @@ async def run():
     startup_msg += f"🔢 الحد الأقصى للمجموعات المتزامنة: {MAX_CONCURRENT_MINTS}\n"
     startup_msg += f"🔄 نظام إعادة المحاولة: نشط لمدة {MAX_RETRY_HOURS} ساعات\n"
     startup_msg += f"💡 الرصيد يُفحص لكل سلسلة بشكل منفصل"
-    enqueue_message(startup_msg)
+    
+    # إرسال مباشر لرسالة البداية
+    await send_telegram_message_direct(startup_msg)
     
     # إرسال تقرير الرصيد الأولي
     async with aiohttp.ClientSession() as session:
         await send_balances_report(session)
     
-    logging.info("🚀 بدء تشغيل النظام...")
+    logging.info("✅ النظام جاهز للعمل")
 
     notified: set[str] = set()
     known_external: set[str] = set()
     checking: set[str] = set()
 
+    # تشغيل المهام مع مرسل تيليجرام
     await asyncio.gather(
         listen_opensea(notified, known_external, checking),
         scan_active_drops(notified, known_external, checking),
-        telegram_sender(),
+        telegram_sender(),  # مرسل الطابور للمتابعة
     )
 
 def main():
