@@ -158,8 +158,8 @@ def decide_quantity(max_per_wallet, remaining_supply):
     - الحد الأقصى 5 رموز فقط لكل معاملة
     """
     if max_per_wallet is None: 
-        return min(5, remaining_supply)
-    return max(1, min(max_per_wallet, remaining_supply, 5))
+        return min(5, remaining_supply)  # 5 كحد أقصى
+    return max(1, min(max_per_wallet, remaining_supply, 5))  # 5 كحد أقصى
 
 def get_web3_from_config(chain_config: dict) -> Web3:
     return Web3(Web3.HTTPProvider(chain_config.get("rpc_url", "")))

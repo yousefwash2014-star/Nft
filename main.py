@@ -2,7 +2,6 @@
 النظام المتكامل: اكتشاف وشراء NFT - بدون تكرار إشعارات
 غاز حقيقي | سرعة 10x | فحص مزدوج | إعادة كل 3ث | إشعار كل 100م
 الحد الأقصى للشراء: 5 رموز فقط
-الشراء فقط من المشاريع التي لديها موقع أو تويتر أو ديسكورد
 """
 
 import asyncio, json, logging, os, time
@@ -36,7 +35,7 @@ def send_telegram(text: str):
     try: send_queue.put_nowait(text)
     except: pass
 
-SENT: Dict[str, Set[str]] = {k: set() for k in ["discovery", "result", "status", "retry", "soldout", "permanent", "progress", "ignored"]}
+SENT: Dict[str, Set[str]] = {k: set() for k in ["discovery", "result", "status", "retry", "soldout", "permanent", "progress"]}
 
 def send_once(cat: str, key: str, text: str):
     if key not in SENT[cat]:
@@ -100,157 +99,101 @@ NOTIFIED = set(); CHECKING = set(); CHECKING_LOCK = asyncio.Lock()
 WALLET_BALANCES = {}; BALANCE_LOCK = asyncio.Lock(); LOW_BALANCE_BY_CHAIN = {}; LOW_BALANCE_NOTIFIED = set()
 _eth_price_cache = {"v": None, "ts": 0}
 
-# ===========================================================================
-# نظام تقييم المشاريع
-# ===========================================================================
+async def get_eth_price(session):
+    now = time.time()
+    if _eth_price_cache["v"] and (now - _eth_price_cache["ts"] < ETH_PRICE_CACHE_TTL): return _eth_price_cache["v"]
+    try:
+        async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd", timeout=aiohttp.ClientTimeout(total=3)) as r:
+            if r.status == 200: p = (await r.json())["ethereum"]["usd"]; _eth_price_cache["v"] = p; _eth_price_cache["ts"] = now; return p
+    except: pass
+    return _eth_price_cache["v"] or 3000.0
 
-def evaluate_project(detail: dict) -> dict:
-    """
-    تقييم المشروع بناءً على وجود تويتر، موقع، ديسكورد
-    """
-    score = 0
-    max_score = 10
-    details = {
-        "has_twitter": False,
-        "has_website": False,
-        "has_discord": False,
-        "twitter_url": "",
-        "website_url": "",
-        "discord_url": "",
-        "score": 0,
-        "score_text": "",
-        "trust_level": "منخفض",
-        "has_any_social": False,
-        "social_links": []
-    }
-    
-    # البحث عن الروابط في الـ detail
-    project_details = detail.get("project_details", {}) or detail.get("details", {})
-    
-    # البحث عن تويتر
-    twitter = project_details.get("twitter") or project_details.get("twitter_url") or ""
-    if twitter:
-        details["has_twitter"] = True
-        details["twitter_url"] = twitter
-        details["social_links"].append(f"🐦 تويتر: {twitter}")
-        score += 3
-    
-    # البحث عن موقع
-    website = project_details.get("website") or project_details.get("website_url") or ""
-    if website:
-        details["has_website"] = True
-        details["website_url"] = website
-        details["social_links"].append(f"🌐 موقع: {website}")
-        score += 3
-    
-    # البحث عن ديسكورد
-    discord = project_details.get("discord") or project_details.get("discord_url") or ""
-    if discord:
-        details["has_discord"] = True
-        details["discord_url"] = discord
-        details["social_links"].append(f"💬 ديسكورد: {discord}")
-        score += 3
-    
-    # البحث عن روابط في external_links
-    external_links = detail.get("external_links", []) or detail.get("links", [])
-    for link in external_links:
-        if isinstance(link, dict):
-            url = link.get("url", "")
-            link_type = link.get("type", "").lower()
-            if "twitter" in link_type or "x.com" in url or "twitter.com" in url:
-                if not details["has_twitter"]:
-                    details["has_twitter"] = True
-                    details["twitter_url"] = url
-                    details["social_links"].append(f"🐦 تويتر: {url}")
-                    score += 3
-            elif "website" in link_type or "site" in link_type:
-                if not details["has_website"]:
-                    details["has_website"] = True
-                    details["website_url"] = url
-                    details["social_links"].append(f"🌐 موقع: {url}")
-                    score += 3
-            elif "discord" in link_type:
-                if not details["has_discord"]:
-                    details["has_discord"] = True
-                    details["discord_url"] = url
-                    details["social_links"].append(f"💬 ديسكورد: {url}")
-                    score += 3
-    
-    # البحث في الـ description عن روابط
-    description = detail.get("description", "") or ""
-    if "twitter.com" in description.lower() and not details["has_twitter"]:
-        # محاولة استخراج رابط تويتر من الوصف
-        import re
-        twitter_match = re.search(r'(https?://(?:www\.)?(?:x\.com|twitter\.com)/[^\s]+)', description)
-        if twitter_match:
-            details["has_twitter"] = True
-            details["twitter_url"] = twitter_match.group(1)
-            details["social_links"].append(f"🐦 تويتر: {twitter_match.group(1)}")
-            score += 3
-    
-    details["has_any_social"] = details["has_twitter"] or details["has_website"] or details["has_discord"]
-    details["score"] = min(score, max_score)
-    
-    # تحديد مستوى الثقة
-    if details["score"] >= 8:
-        details["trust_level"] = "مرتفع جداً"
-        details["score_text"] = "✅ مشروع موثوق مع حضور قوي"
-    elif details["score"] >= 6:
-        details["trust_level"] = "مرتفع"
-        details["score_text"] = "✅ مشروع واعد مع حضور جيد"
-    elif details["score"] >= 4:
-        details["trust_level"] = "متوسط"
-        details["score_text"] = "⚠️ مشروع يحتاج مزيد من التحقق"
-    elif details["score"] >= 2:
-        details["trust_level"] = "منخفض"
-        details["score_text"] = "⚠️ مشروع قليل المعلومات"
-    else:
-        details["trust_level"] = "غير موثوق"
-        details["score_text"] = "❌ مشروع غير موثق - تم تجاهله"
-    
-    return details
+async def update_balances(session):
+    global WALLET_BALANCES, LOW_BALANCE_BY_CHAIN, LOW_BALANCE_NOTIFIED
+    ep = await get_eth_price(session)
+    for cn in ENABLED_CHAINS:
+        w3 = w3_instances.get(cn)
+        if not w3: continue
+        if cn not in LOW_BALANCE_BY_CHAIN: LOW_BALANCE_BY_CHAIN[cn] = set()
+        for w in WALLETS:
+            try:
+                be, _ = get_wallet_balance(w3, w["address"]); bu = be * ep
+                async with BALANCE_LOCK:
+                    if w["address"] not in WALLET_BALANCES: WALLET_BALANCES[w["address"]] = {}
+                    WALLET_BALANCES[w["address"]][cn] = {"eth": be, "usd": bu, "ts": time.time()}
+                if bu < MIN_BALANCE_RESERVE_USD:
+                    LOW_BALANCE_BY_CHAIN[cn].add(w["address"])
+                    nk = f"{w['address']}:{cn}"
+                    if nk not in LOW_BALANCE_NOTIFIED: LOW_BALANCE_NOTIFIED.add(nk); send_telegram(f"⚠️ رصيد منخفض\n\nالمحفظة: {w['name']}\nالسلسلة: {CHAINS_CONFIG[cn]['chain_name_display']}\nالرصيد: ${bu:.4f}\nالحد الأدنى: ${MIN_BALANCE_RESERVE_USD}\n\nتم إيقاف الشراء على هذه السلسلة فقط")
+                else:
+                    if w["address"] in LOW_BALANCE_BY_CHAIN.get(cn, set()): LOW_BALANCE_BY_CHAIN[cn].discard(w["address"])
+            except: pass
 
-def is_project_valid(detail: dict) -> tuple:
-    """
-    التحقق من صحة المشروع - يجب أن يكون لديه تويتر أو موقع أو ديسكورد
-    """
-    eval_result = evaluate_project(detail)
-    is_valid = eval_result["has_any_social"]
-    return is_valid, eval_result
+async def balance_monitor():
+    async with aiohttp.ClientSession() as s: await update_balances(s)
+    while True: await asyncio.sleep(BALANCE_CHECK_INTERVAL); await update_balances(s)
+
+def is_ok(addr, cn): return addr not in LOW_BALANCE_BY_CHAIN.get(cn, set())
+
+class DropCache:
+    def __init__(self, ttl=5): self.c = {}; self.ttl = ttl
+    def get(self, slug):
+        if slug in self.c:
+            d, ts = self.c[slug]
+            if time.time() - ts < self.ttl: return d
+            del self.c[slug]
+        return None
+    def set(self, slug, data): self.c[slug] = (data, time.time())
+
+dc = DropCache(ttl=5)
+
+class SmartScanner:
+    def __init__(self): self.pending = set(); self.last = {}; self.lock = asyncio.Lock(); self.batch_size = 50
+    async def add(self, slug):
+        async with self.lock:
+            if slug not in self.last or time.time() - self.last[slug] > MIN_SCAN_INTERVAL: self.pending.add(slug)
+    async def process(self, session):
+        async with self.lock:
+            batch = list(self.pending)[:self.batch_size]
+            for s in batch: self.pending.discard(s); self.last[s] = time.time()
+        if not batch: return
+        await asyncio.gather(*[handle_mint(session, s, "ethereum") for s in batch], return_exceptions=True)
+
+scanner = SmartScanner()
+
+async def fetch_drop(session, slug):
+    cached = dc.get(slug)
+    if cached: return True, cached
+    try:
+        async with session.get(f"{DROPS_API}/{slug}", headers={"x-api-key": OPENSEA_API_KEY}, timeout=aiohttp.ClientTimeout(total=2)) as r:
+            if r.status == 200: d = await r.json(); dc.set(slug, d); return True, d
+    except: pass
+    return None, None
+
+@dataclass
+class RetryTracker:
+    slug: str; wallet_address: str; chain_name: str; detail: dict; wallet_name: str; wallet_private_key: str
+    price_wei: int; max_per_wallet: Optional[int]; remaining_supply: int
+    stage_name: str = ""; stage: dict = field(default_factory=dict); original_reason: str = ""
+    config: RetryConfig = field(default_factory=lambda: get_retry_config("gas_too_high"))
+    start_time: float = field(default_factory=time.time); attempt_count: int = 0
+    end_time: Optional[datetime] = None
+    @property
+    def retry_key(self): return f"{self.slug}:{self.wallet_address}:{self.chain_name}:{self.stage_name}"
+    @property
+    def should_stop(self):
+        if self.end_time and datetime.now(timezone.utc) > self.end_time: return True
+        if self.remaining_supply <= 0: return True
+        return False
+
+retry_tasks = {}; retry_lock = asyncio.Lock(); mint_sem = asyncio.Semaphore(MAX_CONCURRENT_MINTS)
 
 # ===========================================================================
 # رسائل واضحة ومفهومة
 # ===========================================================================
 
-def build_ignored_msg(detail, cn, eval_result):
-    """رسالة مشروع تم تجاهله لعدم وجود تواصل اجتماعي"""
-    name = detail.get("collection_name") or detail.get("collection_slug", "?")
-    cd = CHAINS_CONFIG.get(cn, {}).get("chain_name_display", cn)
-    
-    lines = [
-        "⏭️ تم تجاهل المشروع - لا يوجد تواصل اجتماعي\n",
-        f"المجموعة: {name}",
-        f"السلسلة: {cd}",
-        "",
-        "📊 تقييم المشروع:",
-        f"  • درجة الثقة: {eval_result['score']}/10 - {eval_result['trust_level']}",
-        f"  • {eval_result['score_text']}",
-        "",
-        "❌ لا يوجد:",
-    ]
-    
-    if not eval_result["has_twitter"]:
-        lines.append("  • تويتر")
-    if not eval_result["has_website"]:
-        lines.append("  • موقع إلكتروني")
-    if not eval_result["has_discord"]:
-        lines.append("  • ديسكورد")
-    
-    lines.append("\n⚠️ لن يتم الشراء من هذا المشروع")
-    return "\n".join(lines)
-
-def build_discovery_msg(detail, cn, stages, eval_result):
-    """رسالة اكتشاف مينت جديد مع تقييم المشروع"""
+def build_discovery_msg(detail, cn, stages):
+    """رسالة اكتشاف مينت جديد"""
     name = detail.get("collection_name") or detail.get("collection_slug", "?")
     url = detail.get("opensea_url", "")
     cd = CHAINS_CONFIG.get(cn, {}).get("chain_name_display", cn)
@@ -265,28 +208,14 @@ def build_discovery_msg(detail, cn, stages, eval_result):
         f"السلسلة: {cd}",
         f"الكمية المتبقية: {rem:,} من {ms:,}",
         f"المحافظ الجاهزة: {ready} من {len(WALLETS)}",
-        f"الحد الأقصى للشراء: 5 رموز لكل معاملة",
-        "",
-        "📊 تقييم المشروع:",
-        f"  • درجة الثقة: {eval_result['score']}/10 - {eval_result['trust_level']}",
-        f"  • {eval_result['score_text']}",
+        f"الحد الأقصى للشراء: 5 رموز لكل معاملة\n",
     ]
-    
-    # عرض الروابط الاجتماعية
-    if eval_result["social_links"]:
-        lines.append("\n🔗 الروابط الاجتماعية:")
-        for link in eval_result["social_links"]:
-            lines.append(f"  • {link}")
-    else:
-        lines.append("\n❌ لا توجد روابط اجتماعية")
-    
-    lines.append("")
     
     if active:
         lines.append("المراحل النشطة:")
         for s in active:
             lines.append(f"  • {s.get('stage', 'عامة')} - الحد: {s.get('max_per_wallet', 'غير محدود')} - مجاني")
-        lines.append("\n✅ المشروع مؤهل للشراء - سيتم بدء الشراء الآن...\n")
+        lines.append("\nسيتم بدء الشراء الآن...\n")
     
     lines.append(f"رابط المجموعة: {url}")
     return "\n".join(lines)
@@ -300,10 +229,10 @@ def build_result_msg(detail, results, cn, sn):
     bad = [r for r in results if not r.success]
     
     lines = [
-        f"📊 نتائج الشراء للمجموعة: {name}",
+        f"نتائج الشراء للمجموعة: {name}",
         f"المرحلة: {sn} | السلسلة: {cd}",
         f"الحد الأقصى للشراء: 5 رموز\n",
-        f"✅ نجاح: {len(ok)} محفظة | ❌ فشل: {len(bad)} محفظة\n",
+        f"نجاح: {len(ok)} محفظة | فشل: {len(bad)} محفظة\n",
     ]
     
     if ok:
@@ -413,103 +342,13 @@ def build_permanent_msg(wallet_name, reason_text):
         f"لا يمكن متابعة المحاولات لهذا السبب"
     )
 
-async def get_eth_price(session):
-    now = time.time()
-    if _eth_price_cache["v"] and (now - _eth_price_cache["ts"] < ETH_PRICE_CACHE_TTL): return _eth_price_cache["v"]
-    try:
-        async with session.get("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd", timeout=aiohttp.ClientTimeout(total=3)) as r:
-            if r.status == 200: p = (await r.json())["ethereum"]["usd"]; _eth_price_cache["v"] = p; _eth_price_cache["ts"] = now; return p
-    except: pass
-    return _eth_price_cache["v"] or 3000.0
-
-async def update_balances(session):
-    global WALLET_BALANCES, LOW_BALANCE_BY_CHAIN, LOW_BALANCE_NOTIFIED
-    ep = await get_eth_price(session)
-    for cn in ENABLED_CHAINS:
-        w3 = w3_instances.get(cn)
-        if not w3: continue
-        if cn not in LOW_BALANCE_BY_CHAIN: LOW_BALANCE_BY_CHAIN[cn] = set()
-        for w in WALLETS:
-            try:
-                be, _ = get_wallet_balance(w3, w["address"]); bu = be * ep
-                async with BALANCE_LOCK:
-                    if w["address"] not in WALLET_BALANCES: WALLET_BALANCES[w["address"]] = {}
-                    WALLET_BALANCES[w["address"]][cn] = {"eth": be, "usd": bu, "ts": time.time()}
-                if bu < MIN_BALANCE_RESERVE_USD:
-                    LOW_BALANCE_BY_CHAIN[cn].add(w["address"])
-                    nk = f"{w['address']}:{cn}"
-                    if nk not in LOW_BALANCE_NOTIFIED: LOW_BALANCE_NOTIFIED.add(nk); send_telegram(f"⚠️ رصيد منخفض\n\nالمحفظة: {w['name']}\nالسلسلة: {CHAINS_CONFIG[cn]['chain_name_display']}\nالرصيد: ${bu:.4f}\nالحد الأدنى: ${MIN_BALANCE_RESERVE_USD}\n\nتم إيقاف الشراء على هذه السلسلة فقط")
-                else:
-                    if w["address"] in LOW_BALANCE_BY_CHAIN.get(cn, set()): LOW_BALANCE_BY_CHAIN[cn].discard(w["address"])
-            except: pass
-
-async def balance_monitor():
-    async with aiohttp.ClientSession() as s: await update_balances(s)
-    while True: await asyncio.sleep(BALANCE_CHECK_INTERVAL); await update_balances(s)
-
-def is_ok(addr, cn): return addr not in LOW_BALANCE_BY_CHAIN.get(cn, set())
-
-class DropCache:
-    def __init__(self, ttl=5): self.c = {}; self.ttl = ttl
-    def get(self, slug):
-        if slug in self.c:
-            d, ts = self.c[slug]
-            if time.time() - ts < self.ttl: return d
-            del self.c[slug]
-        return None
-    def set(self, slug, data): self.c[slug] = (data, time.time())
-
-dc = DropCache(ttl=5)
-
-class SmartScanner:
-    def __init__(self): self.pending = set(); self.last = {}; self.lock = asyncio.Lock(); self.batch_size = 50
-    async def add(self, slug):
-        async with self.lock:
-            if slug not in self.last or time.time() - self.last[slug] > MIN_SCAN_INTERVAL: self.pending.add(slug)
-    async def process(self, session):
-        async with self.lock:
-            batch = list(self.pending)[:self.batch_size]
-            for s in batch: self.pending.discard(s); self.last[s] = time.time()
-        if not batch: return
-        await asyncio.gather(*[handle_mint(session, s, "ethereum") for s in batch], return_exceptions=True)
-
-scanner = SmartScanner()
-
-async def fetch_drop(session, slug):
-    cached = dc.get(slug)
-    if cached: return True, cached
-    try:
-        async with session.get(f"{DROPS_API}/{slug}", headers={"x-api-key": OPENSEA_API_KEY}, timeout=aiohttp.ClientTimeout(total=2)) as r:
-            if r.status == 200: d = await r.json(); dc.set(slug, d); return True, d
-    except: pass
-    return None, None
-
 async def confirm_transaction(w3, tx_hash: str, timeout: int = TX_CONFIRM_TIMEOUT) -> bool:
     try: receipt = await asyncio.to_thread(w3.eth.wait_for_transaction_receipt, tx_hash, timeout); return receipt and receipt.status == 1
     except: return False
 
-@dataclass
-class RetryTracker:
-    slug: str; wallet_address: str; chain_name: str; detail: dict; wallet_name: str; wallet_private_key: str
-    price_wei: int; max_per_wallet: Optional[int]; remaining_supply: int
-    stage_name: str = ""; stage: dict = field(default_factory=dict); original_reason: str = ""
-    config: RetryConfig = field(default_factory=lambda: get_retry_config("gas_too_high"))
-    start_time: float = field(default_factory=time.time); attempt_count: int = 0
-    end_time: Optional[datetime] = None
-    @property
-    def retry_key(self): return f"{self.slug}:{self.wallet_address}:{self.chain_name}:{self.stage_name}"
-    @property
-    def should_stop(self):
-        if self.end_time and datetime.now(timezone.utc) > self.end_time: return True
-        if self.remaining_supply <= 0: return True
-        return False
-
-retry_tasks = {}; retry_lock = asyncio.Lock(); mint_sem = asyncio.Semaphore(MAX_CONCURRENT_MINTS)
-
 # ===========================================================================
 # شراء
 # ===========================================================================
-
 async def process_all(session, slug, detail, stage, cn):
     sn = stage.get("stage", "عام"); pw = int(stage.get("price_wei", "0") or "0")
     mw = stage.get("max_per_wallet")
@@ -660,21 +499,6 @@ async def handle_mint(session, slug, cn):
         if not found or not detail:
             async with CHECKING_LOCK: CHECKING.discard(slug)
             return
-        
-        # ========== تقييم المشروع والتحقق منه ==========
-        is_valid, eval_result = is_project_valid(detail)
-        
-        # عرض تقييم المشروع في الإشعارات
-        if not is_valid:
-            # مشروع غير مؤهل - تجاهله وإرسال إشعار
-            async with CHECKING_LOCK: 
-                CHECKING.discard(slug)
-                NOTIFIED.add(slug)
-            send_once("ignored", slug, build_ignored_msg(detail, cn, eval_result))
-            log.info(f"تم تجاهل المشروع {slug} - لا يوجد تواصل اجتماعي")
-            return
-        
-        # ========== المشروع مؤهل - متابعة الشراء ==========
         ms = int(detail.get("max_supply") or 0); ts = int(detail.get("total_supply") or 0)
         if ms - ts <= 0:
             async with CHECKING_LOCK: CHECKING.discard(slug); NOTIFIED.add(slug)
@@ -684,8 +508,7 @@ async def handle_mint(session, slug, cn):
             async with CHECKING_LOCK: CHECKING.discard(slug); NOTIFIED.add(slug)
             return
         
-        # إرسال إشعار الاكتشاف مع التقييم
-        send_once("discovery", slug, build_discovery_msg(detail, cn, stages, eval_result))
+        send_once("discovery", slug, build_discovery_msg(detail, cn, stages))
         async with CHECKING_LOCK: NOTIFIED.add(slug)
         
         for stage in stages["active"]: await process_all(session, slug, detail, stage, cn)
@@ -767,20 +590,7 @@ async def run():
     if not WALLETS or not ENABLED_CHAINS: await telegram_sender(); return
     for cn in ENABLED_CHAINS: LOW_BALANCE_BY_CHAIN[cn] = set()
     cl = "\n".join([f"  • {CHAINS_CONFIG[c]['chain_name_display']}" for c in ENABLED_CHAINS])
-    send_telegram(
-        f"🚀 تم بدء تشغيل النظام\n\n"
-        f"السلاسل:\n{cl}\n\n"
-        f"عدد المحافظ: {len(WALLETS)}\n"
-        f"الحد الأقصى للغاز: ${MAX_GAS_FEE_USD}\n"
-        f"الحد الأقصى للشراء: 5 رموز لكل معاملة\n"
-        f"سرعة الاكتشاف: 10x\n"
-        f"إعادة المحاولة: كل 3 ثواني\n"
-        f"إشعار التقدم: كل {RETRY_NOTIFY_EVERY} محاولة\n\n"
-        f"🔍 شروط الشراء:\n"
-        f"  • يجب أن يكون المشروع مجاني\n"
-        f"  • يجب أن يكون لديه (تويتر أو موقع أو ديسكورد)\n\n"
-        f"النظام جاهز للعمل"
-    )
+    send_telegram(f"🚀 تم بدء تشغيل النظام\n\nالسلاسل:\n{cl}\n\nعدد المحافظ: {len(WALLETS)}\nالحد الأقصى للغاز: ${MAX_GAS_FEE_USD}\nالحد الأقصى للشراء: 5 رموز لكل معاملة\nسرعة الاكتشاف: 10x\nإعادة المحاولة: كل 3 ثواني\nإشعار التقدم: كل {RETRY_NOTIFY_EVERY} محاولة\nالنظام جاهز للعمل")
     await asyncio.gather(listen_opensea(), scan_drops(), recheck_slugs(None), balance_monitor(), cleanup(), telegram_sender())
 
 def main():
