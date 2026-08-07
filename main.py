@@ -2,6 +2,8 @@
 النظام المتكامل: اكتشاف وشراء NFT - بدون تكرار إشعارات
 غاز حقيقي | سرعة 10x | فحص مزدوج | إعادة كل 3ث | إشعار كل 100م
 الحد الأقصى للشراء: 5 رموز فقط
+
+✅ تمت إضافة: شرط وجود X (تويتر) أو مواقع تواصل أو موقع إلكتروني للشراء
 """
 
 import asyncio, json, logging, os, time
@@ -187,6 +189,41 @@ class RetryTracker:
         return False
 
 retry_tasks = {}; retry_lock = asyncio.Lock(); mint_sem = asyncio.Semaphore(MAX_CONCURRENT_MINTS)
+
+# ===========================================================================
+# ✅ تمت الإضافة: دالة فحص وجود روابط التواصل الإجتماعي
+# ===========================================================================
+def has_social_links(detail: dict) -> bool:
+    """
+    تتحقق إذا كان الحساب/المجموعة يمتلك على الأقل رابط واحد:
+    - X (تويتر سابقاً)
+    - ديسكورد
+    - انستغرام
+    - موقع إلكتروني
+    - تلغرام
+    - ميديام
+    """
+    # الحقول المباشرة في تفاصيل المجموعة
+    if detail.get("twitter_username"): return True
+    if detail.get("discord_url"): return True
+    if detail.get("instagram_username"): return True
+    if detail.get("website_url") or detail.get("external_url"): return True
+    if detail.get("telegram_url"): return True
+    if detail.get("medium_username"): return True
+    if detail.get("wiki_url"): return True
+
+    # بعض البيانات تكون متداخلة تحت مفتاح collection
+    collection = detail.get("collection", {})
+    if isinstance(collection, dict):
+        if collection.get("twitter_username"): return True
+        if collection.get("discord_url"): return True
+        if collection.get("instagram_username"): return True
+        if collection.get("website_url") or collection.get("external_url"): return True
+        if collection.get("telegram_url"): return True
+        if collection.get("medium_username"): return True
+
+    # لو لم نجد أي رابط، نرجع False
+    return False
 
 # ===========================================================================
 # رسائل واضحة ومفهومة
@@ -499,6 +536,15 @@ async def handle_mint(session, slug, cn):
         if not found or not detail:
             async with CHECKING_LOCK: CHECKING.discard(slug)
             return
+
+        # ✅ تمت الإضافة: تخطي المجموعة إذا لم يكن لديها أي روابط تواصل اجتماعي
+        if not has_social_links(detail):
+            log.info(f"⏭️ تم تجاهل {slug} لعدم وجود X أو مواقع تواصل أو موقع إلكتروني")
+            async with CHECKING_LOCK:
+                CHECKING.discard(slug)
+                NOTIFIED.add(slug)   # نضيفها حتى لا نفحصها مرة أخرى
+            return
+
         ms = int(detail.get("max_supply") or 0); ts = int(detail.get("total_supply") or 0)
         if ms - ts <= 0:
             async with CHECKING_LOCK: CHECKING.discard(slug); NOTIFIED.add(slug)
@@ -590,7 +636,7 @@ async def run():
     if not WALLETS or not ENABLED_CHAINS: await telegram_sender(); return
     for cn in ENABLED_CHAINS: LOW_BALANCE_BY_CHAIN[cn] = set()
     cl = "\n".join([f"  • {CHAINS_CONFIG[c]['chain_name_display']}" for c in ENABLED_CHAINS])
-    send_telegram(f"🚀 تم بدء تشغيل النظام\n\nالسلاسل:\n{cl}\n\nعدد المحافظ: {len(WALLETS)}\nالحد الأقصى للغاز: ${MAX_GAS_FEE_USD}\nالحد الأقصى للشراء: 5 رموز لكل معاملة\nسرعة الاكتشاف: 10x\nإعادة المحاولة: كل 3 ثواني\nإشعار التقدم: كل {RETRY_NOTIFY_EVERY} محاولة\nالنظام جاهز للعمل")
+    send_telegram(f"🚀 تم بدء تشغيل النظام\n\nالسلاسل:\n{cl}\n\nعدد المحافظ: {len(WALLETS)}\nالحد الأقصى للغاز: ${MAX_GAS_FEE_USD}\nالحد الأقصى للشراء: 5 رموز لكل معاملة\nسرعة الاكتشاف: 10x\nإعادة المحاولة: كل 3 ثواني\nإشعار التقدم: كل {RETRY_NOTIFY_EVERY} محاولة\n\n✅ شرط الشراء: وجود X أو تواصل اجتماعي أو موقع إلكتروني\nالنظام جاهز للعمل")
     await asyncio.gather(listen_opensea(), scan_drops(), recheck_slugs(None), balance_monitor(), cleanup(), telegram_sender())
 
 def main():
