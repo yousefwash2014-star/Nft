@@ -1,0 +1,32 @@
+services:
+  mint-bot:
+    build: .
+    image: mint-bot:turbo-fast
+    container_name: mint-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: Asia/Aden
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import pathlib; pathlib.Path('/app/data').is_dir()"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  test-runner:
+    build: .
+    image: mint-bot:turbo-fast
+    container_name: mint-bot-tests
+    command: sh -c "python test_all.py"
+    profiles: [test]
+    volumes:
+      - ./data:/app/data

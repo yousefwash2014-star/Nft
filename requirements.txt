@@ -1,28 +1,8 @@
-# ============================================
-# قائمة المكتبات المطلوبة لتشغيل النظام
-# ============================================
-# يتم تثبيتها باستخدام: pip install -r requirements.txt
-
-# مكتبة HTTP قديمة (تبقى للتوافق)
-# لكننا نستخدم aiohttp بدلاً منها في الكود الرئيسي
-requests
-
-# مكتبة WebSocket للاتصال بـ OpenSea Stream
-websockets
-
-# لتحميل متغيرات البيئة من ملف .env
-# مثال: OPENSEA_API_KEY=your_key_here
-python-dotenv
-
-# مكتبة Web3 للتفاعل مع شبكات الإيثيريوم
-# تستخدم لقراءة الرصيد، إرسال المعاملات، استعلام العقود
-web3
-
-# مكتبة HTTP غير متزامنة (أسرع من requests)
-# تستخدم لطلبات API وجلب سعر ETH
-aiohttp
-
-# إضافات سرعة لـ aiohttp
-# تحسن أداء الاتصالات بشكل ملحوظ
-aiohttp[speedups]
-
+web3==6.11.3
+eth-account==0.11.2
+eth-abi==5.0.0
+aiohttp==3.9.1
+websockets==12.0
+python-dotenv==1.0.0
+requests==2.31.0
+setuptools==69.0.3
