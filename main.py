@@ -176,7 +176,8 @@ FREE_PRICE_THRESHOLD_USD = 0.00015
 SCAN_INTERVAL = max(0.25 if ULTRA_MODE else 0.5, float(os.environ.get(
     "SCAN_INTERVAL", "0.25" if ULTRA_MODE else ("0.5" if TURBO_MODE else "3")
 )))
-MAX_RETRY_HOURS = 6
+MAX_RETRY_HOURS = max(0.0, float(os.environ.get("MAX_RETRY_HOURS", "6")))
+MAX_RETRY_ATTEMPTS = max(0, int(os.environ.get("MAX_RETRY_ATTEMPTS", "2") or "2"))
 PENDING_TX_MONITOR = os.environ.get("PENDING_TX_MONITOR", "false").strip().lower() == "true"
 PENDING_TX_MAX_INFLIGHT = max(1, int(os.environ.get("PENDING_TX_MAX_INFLIGHT", "32") or "32"))
 
@@ -1101,8 +1102,15 @@ async def execute_wallet_task(
 
 
 async def schedule_single_retry(tracker: RetryTracker):
+    # حماية افتراضية: لا نعيد بث mint تلقائيًا بعد فشل غير محسوم.
+    # يمكن تفعيل retries صراحةً بعد التأكد من مراقبة pending_transactions.
+    if MAX_RETRY_ATTEMPTS <= 0:
+        log.warning("🛑 Retry disabled for '%s' (MAX_RETRY_ATTEMPTS=0)", tracker.slug)
+        async with retry_lock:
+            retry_tasks.pop(f"{tracker.slug}:{tracker.wallet_address}:{tracker.chain_name}", None)
+        return
     wait_time = 15 if "gas" in tracker.original_reason else 60
-    max_tries = 8
+    max_tries = MAX_RETRY_ATTEMPTS
     while not tracker.is_expired and tracker.attempt_count <= max_tries:
         await asyncio.sleep(wait_time)
         tracker.attempt_count += 1

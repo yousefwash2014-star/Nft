@@ -1123,6 +1123,8 @@ def attempt_purchase_seadrop(
     wallet_lock = get_wallet_lock(wallet_address, current_chain_id)
     wallet_lock.acquire()
     raw_tx = None
+    tx_send_attempted = False
+    tx_hash_hex = ""
     try:
         contract = w3.eth.contract(address=checksum_seadrop, abi=SEADROP_ABI)
         _rpc_limiter.acquire()
@@ -1158,8 +1160,10 @@ def attempt_purchase_seadrop(
         signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
         raw_tx = getattr(signed_tx, "raw_transaction", None) or getattr(signed_tx, "rawTransaction", None)
         _rpc_limiter.acquire()
+        # من هذه النقطة لا نعيد استخدام nonce حتى لو أعاد RPC خطأً؛
+        # قد يكون قبل المعاملة ثم قبلها فعليًا دون إعادة hash للعميل.
+        tx_send_attempted = True
         tx_hash = w3.eth.send_raw_transaction(raw_tx)
-
         tx_hash_hex = tx_hash.hex()
         if WAIT_FOR_RECEIPT:
             try:
@@ -1196,6 +1200,17 @@ def attempt_purchase_seadrop(
                 "gas_fee_usd": gas_fee_usd_actual, "total_value_wei": total_value, "balance_usd": balance_usd}
     except Exception as e:
         error_msg = str(e).lower()
+        # بعد قبول send_raw_transaction لا يجوز إنشاء nonce جديد عند أي
+        # خطأ لاحق؛ المعاملة الأصلية قد تكون pending أو mined رغم فشل RPC.
+        if tx_send_attempted:
+            return {
+                "success": False,
+                "reason": "tx_pending",
+                "tx_hash": tx_hash_hex or (Web3.keccak(raw_tx).hex() if raw_tx else ""),
+                "quantity": quantity,
+                "error": f"RPC error after broadcast; do not retry: {str(e)}",
+                "balance_usd": balance_usd,
+            }
         quantity_error = _decode_seadrop_quantity_error(error_msg)
         if quantity_error:
             reason = "already_minted"
@@ -1283,8 +1298,9 @@ def attempt_purchase_universal(
                     signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
                     raw_tx = getattr(signed_tx, "raw_transaction", None) or getattr(signed_tx, "rawTransaction", None)
                     _rpc_limiter.acquire()
-                    tx_hash = w3.eth.send_raw_transaction(raw_tx)
+                    # بعد بدء الإرسال لا نجرّب ABI الآخر ولا nonce جديدًا.
                     broadcasted = True
+                    tx_hash = w3.eth.send_raw_transaction(raw_tx)
                     consume_cached_nonce(current_chain_id, checksum_wallet, nonce)
                     result = _receipt_result(w3, tx_hash, priority_gas_price, quantity, eth_price_usd)
                     result.setdefault("gas_fee_usd", gas_fee_usd)
@@ -1348,6 +1364,7 @@ def attempt_purchase_drop_api(
     if acquired_here:
         wallet_lock.acquire()
     raw_tx = None
+    tx_send_attempted = False
     try:
         target = Web3.to_checksum_address(tx_data["target"])
         wallet = Web3.to_checksum_address(wallet_address)
@@ -1369,6 +1386,7 @@ def attempt_purchase_drop_api(
         signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
         raw_tx = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
         _rpc_limiter.acquire()
+        tx_send_attempted = True
         tx_hash = w3.eth.send_raw_transaction(raw_tx)
         consume_cached_nonce(int(w3.eth.chain_id), wallet, nonce)
         tx_hash_hex = tx_hash.hex()
@@ -1385,6 +1403,10 @@ def attempt_purchase_drop_api(
         return result
     except Exception as exc:
         msg = str(exc).lower()
+        if tx_send_attempted:
+            tx_hash = Web3.keccak(raw_tx).hex() if raw_tx else ""
+            return {"success": False, "reason": "tx_pending", "tx_hash": tx_hash,
+                    "error": f"RPC error after fast broadcast attempt; do not fallback: {str(exc)}"}
         if "already known" in msg or "known transaction" in msg:
             tx_hash = Web3.keccak(raw_tx).hex() if raw_tx else ""
             return {"success": False, "reason": "tx_pending", "tx_hash": tx_hash,
@@ -1454,18 +1476,16 @@ def execute_purchase_pipeline(
         }
     price_wei = 0
 
-    # الفحوص التفصيلية تبدأ فقط بعد فشل المسار الخاطف قبل البث.
-    if FAST_SUBMIT_MODE:
-        balance_usd = -1.0
-    else:
-        balance_usd = get_wallet_balance_usd(w3, wallet_address, eth_price_usd)
-        if balance_usd < 0:
-            return {"success": False, "reason": "balance_read_failed", "balance_usd": 0, "attempt_mode": "normal_checked"}
-        if balance_usd < MIN_BALANCE_RESERVE_USD:
-            return {"success": False, "reason": "balance_too_low", "balance_usd": balance_usd, "attempt_mode": "normal_checked"}
-        gas_fee_usd = estimate_gas_fee_usd(w3, eth_price_usd)
-        if gas_fee_usd > MAX_GAS_FEE_USD:
-            return {"success": False, "reason": "gas_too_high", "balance_usd": balance_usd, "gas_fee_usd": gas_fee_usd, "attempt_mode": "normal_checked"}
+    # بعد فشل Fast وقبل أي بث عادي، لا نتجاوز الفحوص حتى لو كان
+    # SKIP_BALANCE_CHECK_RACE مفعلاً؛ ذلك الخيار خاص بالمسار التنافسي فقط.
+    balance_usd = get_wallet_balance_usd(w3, wallet_address, eth_price_usd)
+    if balance_usd < 0:
+        return {"success": False, "reason": "balance_read_failed", "balance_usd": 0, "attempt_mode": "normal_checked"}
+    if balance_usd < MIN_BALANCE_RESERVE_USD:
+        return {"success": False, "reason": "balance_too_low", "balance_usd": balance_usd, "attempt_mode": "normal_checked"}
+    gas_fee_usd = estimate_gas_fee_usd(w3, eth_price_usd)
+    if gas_fee_usd > MAX_GAS_FEE_USD:
+        return {"success": False, "reason": "gas_too_high", "balance_usd": balance_usd, "gas_fee_usd": gas_fee_usd, "attempt_mode": "normal_checked"}
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         ownership_future = pool.submit(get_wallet_ownership_balance, w3, nft_contract, wallet_address, chain_name)
