@@ -6,7 +6,7 @@ import tempfile
 import threading
 import time
 
-DEFAULT_PATH = os.getenv("MINT_HISTORY_FILE", "mint_history.json")
+DEFAULT_PATH = "mint_history.json"
 
 
 class MintHistory:

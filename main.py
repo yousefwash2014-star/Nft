@@ -145,41 +145,35 @@ async def get_next_opensea_key() -> str:
 # ===================================================================
 # ⚙️ متغيرات التشغيل
 # ===================================================================
-BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").strip().lower() == "true"
-CHECK_TWITTER = os.environ.get("CHECK_TWITTER", "false").strip().lower() == "true"
-ENABLE_UNIVERSAL_MINTS = os.environ.get("ENABLE_UNIVERSAL_MINTS", "true").strip().lower() == "true"
-TELEGRAM_NOTIFY_FAILURES = os.environ.get("TELEGRAM_NOTIFY_FAILURES", "false").strip().lower() == "true"
-VERIFY_ONCHAIN_PRICE = os.environ.get("VERIFY_ONCHAIN_PRICE", "true").strip().lower() == "true"
-SKIP_BALANCE_CHECK_RACE = os.environ.get("SKIP_BALANCE_CHECK_RACE", "false").strip().lower() == "true"
-FIXED_GAS_LIMIT = int(os.environ.get("FIXED_GAS_LIMIT", "0") or "0")
+BOT_ENABLED = False  # ثابت مدمج: لا يبدأ التنفيذ الحقيقي افتراضياً
+CHECK_TWITTER = False
+ENABLE_UNIVERSAL_MINTS = False
+TELEGRAM_NOTIFY_FAILURES = False
+VERIFY_ONCHAIN_PRICE = True
+SKIP_BALANCE_CHECK_RACE = True
+FIXED_GAS_LIMIT = 185000
 FAST_SUBMIT_MODE = SKIP_BALANCE_CHECK_RACE and FIXED_GAS_LIMIT > 0
-NOTIFY_SCHEDULED = os.environ.get("NOTIFY_SCHEDULED", "true").strip().lower() == "true"
+NOTIFY_SCHEDULED = True
 # عند تعطيله، لا تُنشأ مهام للمراحل المستقبلية؛ ينتظر الماسح/الـ Stream حتى تصبح Public مفتوحة.
-SCHEDULE_FUTURE_STAGES = os.environ.get("SCHEDULE_FUTURE_STAGES", "false").strip().lower() == "true"
+SCHEDULE_FUTURE_STAGES = False
 
 STREAM_URL_BASE = "wss://stream-api.opensea.io/socket/websocket?token={token}&vsn=2.0.0"
 DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 LOCAL_TZ = timezone(timedelta(hours=3))
 
-PERFORMANCE_PROFILE = os.environ.get("PERFORMANCE_PROFILE", "balanced").strip().lower()
+PERFORMANCE_PROFILE = "turbo"
 TURBO_MODE = PERFORMANCE_PROFILE in {"turbo", "fast", "speed", "ultra"}
 ULTRA_MODE = PERFORMANCE_PROFILE == "ultra"
-MAX_CONCURRENT_MINTS = max(1, int(os.environ.get(
-    "MAX_CONCURRENT_MINTS", "40" if ULTRA_MODE else ("30" if TURBO_MODE else "5")
-)))
+MAX_CONCURRENT_MINTS = 30
 HEARTBEAT_INTERVAL = 30
-RECV_TIMEOUT = max(1, float(os.environ.get(
-    "RECV_TIMEOUT", "1" if ULTRA_MODE else ("2" if TURBO_MODE else "5")
-)))
+RECV_TIMEOUT = 1.0
 FREE_PRICE_THRESHOLD_USD = 0.00015
-SCAN_INTERVAL = max(0.25 if ULTRA_MODE else 0.5, float(os.environ.get(
-    "SCAN_INTERVAL", "0.25" if ULTRA_MODE else ("0.5" if TURBO_MODE else "3")
-)))
-MAX_RETRY_HOURS = max(0.0, float(os.environ.get("MAX_RETRY_HOURS", "6")))
-MAX_RETRY_ATTEMPTS = max(0, int(os.environ.get("MAX_RETRY_ATTEMPTS", "2") or "2"))
-PENDING_TX_MONITOR = os.environ.get("PENDING_TX_MONITOR", "false").strip().lower() == "true"
-PENDING_TX_MAX_INFLIGHT = max(1, int(os.environ.get("PENDING_TX_MAX_INFLIGHT", "32") or "32"))
+SCAN_INTERVAL = 0.5
+MAX_RETRY_HOURS = 6.0
+MAX_RETRY_ATTEMPTS = 2
+PENDING_TX_MONITOR = False
+PENDING_TX_MAX_INFLIGHT = 32
 
 
 def http_session() -> aiohttp.ClientSession:
@@ -452,9 +446,7 @@ def schedule_evaluation(session, slug: str, chain_key: str) -> None:
     task.add_done_callback(_cleanup)
 mint_history = MintHistory()
 REJECTION_COOLDOWN_SECONDS = 180
-FAILED_COOLDOWN_SECONDS = max(
-    0.0, float(os.environ.get("FAILED_COOLDOWN_SECONDS", "1"))
-)
+FAILED_COOLDOWN_SECONDS = 1.0
 
 semaphore = asyncio.Semaphore(MAX_CONCURRENT_MINTS)
 
@@ -768,7 +760,7 @@ class OpenSeaRateLimiter:
             log.info("[Rate Limiter] تعافٍ → %.2f req/s", self._rate)
 
 
-OPENSEA_RATE_PER_KEY = float(os.environ.get("OPENSEA_RATE_PER_KEY", "1.5"))
+OPENSEA_RATE_PER_KEY = 3.5
 _opensea_limiter = OpenSeaRateLimiter(
     rate_per_second=max(1.0, OPENSEA_RATE_PER_KEY * max(1, len(OPENSEA_API_KEYS)))
 )

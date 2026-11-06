@@ -52,8 +52,8 @@ _rpc_cycle_locks: dict[str, threading.Lock] = {}
 _rpc_health: dict[str, tuple[float, int]] = {}
 _rpc_health_lock = threading.Lock()
 CHAIN_NAME_BY_ID = {1: "ethereum", 4663: "robinhood", 57073: "ink", 5042: "arc"}
-REQUIRE_MINT_STATS = os.environ.get("REQUIRE_MINT_STATS", "true").strip().lower() == "true"
-REQUIRE_OWNERSHIP_CHECK = os.environ.get("REQUIRE_OWNERSHIP_CHECK", "true").strip().lower() == "true"
+REQUIRE_MINT_STATS = True
+REQUIRE_OWNERSHIP_CHECK = True
 
 
 def _get_next_rpc(chain_name: str) -> str:
@@ -148,8 +148,8 @@ class _RpcRateLimiter:
             time.sleep(wait)
 
 
-_rpc_limiter = _RpcRateLimiter(rate=float(os.environ.get("RPC_RATE_LIMIT", "18")))
-_rpc_limiter_fast = _RpcRateLimiter(rate=float(os.environ.get("RPC_FAST_RATE_LIMIT", "40")))
+_rpc_limiter = _RpcRateLimiter(rate=18.0)
+_rpc_limiter_fast = _RpcRateLimiter(rate=40.0)
 _mint_api_local = threading.local()
 
 def _mint_api_session():
@@ -273,33 +273,30 @@ NFT_MINT_STATS_ABI = [
 # ===========================================================================
 MAX_GAS_FEE_USD = 0.5
 MIN_BALANCE_RESERVE_USD = 0.10
-WAIT_FOR_RECEIPT = os.environ.get("WAIT_FOR_RECEIPT", "true").strip().lower() == "true"
-RECEIPT_TIMEOUT_SECONDS = max(5, int(os.environ.get("RECEIPT_TIMEOUT_SECONDS", "45") or "45"))
+WAIT_FOR_RECEIPT = True
+RECEIPT_TIMEOUT_SECONDS = 45
 FEW_THRESHOLD = 20
 LIMITED_BUY_QTY = 50
 GAS_LIMIT_SAFETY_MARGIN = 1.2
 MAX_ETH_PER_TX = 0
-SKIP_BALANCE_CHECK_RACE = os.environ.get("SKIP_BALANCE_CHECK_RACE", "false").strip().lower() == "true"
-FIXED_GAS_LIMIT = int(os.environ.get("FIXED_GAS_LIMIT", "0") or "0")
+SKIP_BALANCE_CHECK_RACE = True
+FIXED_GAS_LIMIT = 185000
 FAST_SUBMIT_MODE = SKIP_BALANCE_CHECK_RACE and FIXED_GAS_LIMIT > 0
-FAST_FIRST_ENABLED = os.environ.get("FAST_FIRST_ENABLED", "true").strip().lower() == "true"
+FAST_FIRST_ENABLED = True
 
-RACE_MODE = os.environ.get("RACE_MODE", "false").strip().lower() == "true"
-RACE_GAS_BOOST = float(os.environ.get("RACE_GAS_BOOST", "1.35"))
-RACE_MAX_ATTEMPTS = int(os.environ.get("RACE_MAX_ATTEMPTS", "1") or "1")
-RACE_RETRY_DELAY_MS = int(os.environ.get("RACE_RETRY_DELAY_MS", "120") or "120")
-RACE_PRE_SUBMIT_SECONDS = float(os.environ.get("RACE_PRE_SUBMIT_SECONDS", "0.6"))
+RACE_MODE = False
+RACE_GAS_BOOST = 1.35
+RACE_MAX_ATTEMPTS = 1
+RACE_RETRY_DELAY_MS = 120
+RACE_PRE_SUBMIT_SECONDS = 0.6
 
 # الحماية الافتراضية: معاملة واحدة لكل محفظة/مينت.
-ALLOW_MULTIPLE_TX_PER_MINT = os.environ.get("ALLOW_MULTIPLE_TX_PER_MINT", "false").strip().lower() == "true"
-RACE_CASCADE_ENABLED = (
-    ALLOW_MULTIPLE_TX_PER_MINT
-    and os.environ.get("RACE_CASCADE_ENABLED", "false").strip().lower() == "true"
-)
-RACE_CASCADE_SIZE = max(1, int(os.environ.get("RACE_CASCADE_SIZE", "3") or "3"))
-RACE_CASCADE_DELAY_MS = max(0, int(os.environ.get("RACE_CASCADE_DELAY_MS", "35") or "35"))
-RACE_CASCADE_GAS_STEP = float(os.environ.get("RACE_CASCADE_GAS_STEP", "1.18") or "1.18")
-RACE_MAX_WORKERS = max(1, int(os.environ.get("RACE_MAX_WORKERS", "8") or "8"))
+ALLOW_MULTIPLE_TX_PER_MINT = False
+RACE_CASCADE_ENABLED = False
+RACE_CASCADE_SIZE = 3
+RACE_CASCADE_DELAY_MS = 35
+RACE_CASCADE_GAS_STEP = 1.18
+RACE_MAX_WORKERS = 8
 
 # ===========================================================================
 # 💰 Gas Caps لكل سلسلة
@@ -311,19 +308,10 @@ DEFAULT_GAS_CAP_BY_CHAIN: dict[str, float] = {
     "arc":       0.05,
 }
 
-RACE_MAX_GAS_FEE_USD_FALLBACK = float(
-    os.environ.get("RACE_MAX_GAS_FEE_USD", "0.20") or "0.20"
-)
+RACE_MAX_GAS_FEE_USD_FALLBACK = 0.20
 
 
 def _resolve_gas_cap(chain_name: str) -> float:
-    env_key = f"RACE_MAX_GAS_FEE_USD_{chain_name.upper()}"
-    env_val = os.environ.get(env_key, "").strip()
-    if env_val:
-        try:
-            return float(env_val)
-        except ValueError:
-            log.warning("⚠️ قيمة %s غير صالحة (%r)، استخدام الافتراضي", env_key, env_val)
     if chain_name in DEFAULT_GAS_CAP_BY_CHAIN:
         return DEFAULT_GAS_CAP_BY_CHAIN[chain_name]
     return RACE_MAX_GAS_FEE_USD_FALLBACK
@@ -379,8 +367,8 @@ _gas_price_cache_lock = threading.Lock()
 GAS_PRICE_CACHE_TTL = 5
 _nonce_cache: dict[str, tuple[float, int]] = {}
 _nonce_cache_lock = threading.Lock()
-NONCE_CACHE_TTL = max(0.5, float(os.environ.get("NONCE_CACHE_TTL", "8")))
-PREFETCH_NONCE = os.environ.get("PREFETCH_NONCE", "true").strip().lower() == "true"
+NONCE_CACHE_TTL = 8.0
+PREFETCH_NONCE = True
 
 def get_cached_pending_nonce(w3: Web3, wallet_address: str, force_refresh: bool = False) -> int:
     chain_id = int(w3.eth.chain_id)
