@@ -18,5 +18,5 @@ This package is based on the latest compatible TURBO/Eligible Free-Mint source i
 ## Railway
 The included `railway.toml` uses NIXPACKS and starts `python3 main.py`. For persistent history, add a Railway Volume mounted at `/app/data` if the deployment needs filesystem persistence.
 
-## Fast behavior
-The source starts in `ultra` fast-first mode by default. It uses the fixed gas limit and fast broadcast path, while retaining wallet ownership, mint-history, and on-chain price checks as safeguards. Set `BOT_ENABLED = False` in `main.py` before any dry run that must not submit transactions.
+## Safety behavior
+The included source is the compatible free-mint/eligibility version: it validates wallet eligibility before transaction construction and only announces confirmed mined success. Review `.env.example` before enabling live operation.

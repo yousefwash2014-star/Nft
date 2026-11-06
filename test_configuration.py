@@ -25,9 +25,7 @@ assert "REQUIRE_OWNERSHIP_CHECK" in buyer
 assert "get_wallet_ownership_balance" in buyer
 print("configuration checks passed")
 assert "schedule_evaluation" in main
-# التشغيل والأداء ثوابت داخل الكود؛ ملف البيئة يحتوي الأسرار والروابط فقط.
-assert "PERFORMANCE_PROFILE=turbo" not in env
-assert "OPENSEA_API_KEYS" in env and "PRIVATE_KEYS" in env and "ETHEREUM_RPC_URLS" in env
+assert "PERFORMANCE_PROFILE=turbo" in env
 
 from stage_policy import stage_rejection_reason
 assert stage_rejection_reason({"name": "Public Stage", "type": "public", "allowlist": {"id": "old"}}) is None

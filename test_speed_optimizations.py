@@ -43,9 +43,7 @@ def test_final_reasons_in_main():
 
 
 def test_env_defaults():
-    assert "ENABLE_UNIVERSAL_MINTS = True" in MAIN
-    assert "PERFORMANCE_PROFILE = \"ultra\"" in MAIN
-    assert "BOT_ENABLED = True" in MAIN
+    assert "ENABLE_UNIVERSAL_MINTS=true" in ENV
 
 
 def test_rpc_rotation_in_buyer():

@@ -148,8 +148,8 @@ class _RpcRateLimiter:
             time.sleep(wait)
 
 
-_rpc_limiter = _RpcRateLimiter(rate=18.0)
-_rpc_limiter_fast = _RpcRateLimiter(rate=40.0)
+_rpc_limiter = _RpcRateLimiter(rate=float(os.environ.get("RPC_RATE_LIMIT", "18")))
+_rpc_limiter_fast = _RpcRateLimiter(rate=float(os.environ.get("RPC_FAST_RATE_LIMIT", "40")))
 _mint_api_local = threading.local()
 
 def _mint_api_session():
@@ -285,18 +285,18 @@ FAST_SUBMIT_MODE = SKIP_BALANCE_CHECK_RACE and FIXED_GAS_LIMIT > 0
 FAST_FIRST_ENABLED = True
 
 RACE_MODE = False
-RACE_GAS_BOOST = 1.35
+RACE_GAS_BOOST = float(os.environ.get("RACE_GAS_BOOST", "1.35"))
 RACE_MAX_ATTEMPTS = 1
-RACE_RETRY_DELAY_MS = 120
-RACE_PRE_SUBMIT_SECONDS = 0.6
+RACE_RETRY_DELAY_MS = int(os.environ.get("RACE_RETRY_DELAY_MS", "120") or "120")
+RACE_PRE_SUBMIT_SECONDS = float(os.environ.get("RACE_PRE_SUBMIT_SECONDS", "0.6"))
 
 # الحماية الافتراضية: معاملة واحدة لكل محفظة/مينت.
 ALLOW_MULTIPLE_TX_PER_MINT = False
 RACE_CASCADE_ENABLED = False
-RACE_CASCADE_SIZE = 3
-RACE_CASCADE_DELAY_MS = 35
-RACE_CASCADE_GAS_STEP = 1.18
-RACE_MAX_WORKERS = 8
+RACE_CASCADE_SIZE = 1
+RACE_CASCADE_DELAY_MS = max(0, int(os.environ.get("RACE_CASCADE_DELAY_MS", "35") or "35"))
+RACE_CASCADE_GAS_STEP = float(os.environ.get("RACE_CASCADE_GAS_STEP", "1.18") or "1.18")
+RACE_MAX_WORKERS = max(1, int(os.environ.get("RACE_MAX_WORKERS", "8") or "8"))
 
 # ===========================================================================
 # 💰 Gas Caps لكل سلسلة
@@ -367,8 +367,8 @@ _gas_price_cache_lock = threading.Lock()
 GAS_PRICE_CACHE_TTL = 5
 _nonce_cache: dict[str, tuple[float, int]] = {}
 _nonce_cache_lock = threading.Lock()
-NONCE_CACHE_TTL = 8.0
-PREFETCH_NONCE = True
+NONCE_CACHE_TTL = max(0.5, float(os.environ.get("NONCE_CACHE_TTL", "8")))
+PREFETCH_NONCE = os.environ.get("PREFETCH_NONCE", "true").strip().lower() == "true"
 
 def get_cached_pending_nonce(w3: Web3, wallet_address: str, force_refresh: bool = False) -> int:
     chain_id = int(w3.eth.chain_id)

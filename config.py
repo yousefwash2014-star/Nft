@@ -1,16 +1,39 @@
 """إعدادات مركزية — TURBO++ v4.5 (FAST محاولتان → SAFE)"""
 import itertools
+import os
 import threading
 import asyncio
 import time
 import logging
-import os
 from typing import List
 from dotenv import load_dotenv
 
 load_dotenv()
 
 _log = logging.getLogger("config")
+
+
+def env_bool(k, default=False):
+    v = os.getenv(k, "").strip().lower()
+    if v in {"1", "true", "yes", "on"}:
+        return True
+    if v in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def env_int(k, default=0):
+    try:
+        return int(os.getenv(k, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def env_float(k, default=0.0):
+    try:
+        return float(os.getenv(k, str(default)))
+    except (TypeError, ValueError):
+        return default
 
 
 def split_csv(raw):
@@ -89,7 +112,7 @@ class AsyncRateLimiter:
 
 
 DEFAULT_CHAINS = "ethereum,robinhood,ink,arc,polygon"
-ENABLED_CHAINS_LIST = split_csv(DEFAULT_CHAINS)
+ENABLED_CHAINS_LIST = split_csv(os.getenv("ENABLED_CHAINS", DEFAULT_CHAINS))
 
 if not ENABLED_CHAINS_LIST:
     _log.critical("🔴 ENABLED_CHAINS فارغ — لا شبكات مفعّلة!")
@@ -144,7 +167,7 @@ def load_rpc_pools():
 
 OPENSEA_KEYS = load_api_keys()
 RPC_POOLS = load_rpc_pools()
-OPENSEA_RATE_LIMITER = AsyncRateLimiter(3.0)
+OPENSEA_RATE_LIMITER = AsyncRateLimiter(env_float("OPENSEA_RATE_PER_SECOND", 3.0))
 
 _log.info("🌐 ENABLED_CHAINS: %s", ", ".join(ENABLED_CHAINS_LIST))
 _log.info("🌐 CHAIN_CONFIG: %s", ", ".join(CHAIN_CONFIG.keys()))
