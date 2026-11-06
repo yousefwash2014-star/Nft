@@ -145,9 +145,9 @@ async def get_next_opensea_key() -> str:
 # ===================================================================
 # ⚙️ متغيرات التشغيل
 # ===================================================================
-BOT_ENABLED = False  # ثابت مدمج: لا يبدأ التنفيذ الحقيقي افتراضياً
+BOT_ENABLED = True  # الوضع الخاطف مفعّل افتراضياً؛ عطّله يدوياً قبل التشغيل التجريبي
 CHECK_TWITTER = False
-ENABLE_UNIVERSAL_MINTS = False
+ENABLE_UNIVERSAL_MINTS = True
 TELEGRAM_NOTIFY_FAILURES = False
 VERIFY_ONCHAIN_PRICE = True
 SKIP_BALANCE_CHECK_RACE = True
@@ -162,14 +162,14 @@ DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 LOCAL_TZ = timezone(timedelta(hours=3))
 
-PERFORMANCE_PROFILE = "turbo"
+PERFORMANCE_PROFILE = "ultra"
 TURBO_MODE = PERFORMANCE_PROFILE in {"turbo", "fast", "speed", "ultra"}
 ULTRA_MODE = PERFORMANCE_PROFILE == "ultra"
-MAX_CONCURRENT_MINTS = 30
+MAX_CONCURRENT_MINTS = 40
 HEARTBEAT_INTERVAL = 30
 RECV_TIMEOUT = 1.0
 FREE_PRICE_THRESHOLD_USD = 0.00015
-SCAN_INTERVAL = 0.5
+SCAN_INTERVAL = 0.25
 MAX_RETRY_HOURS = 6.0
 MAX_RETRY_ATTEMPTS = 2
 PENDING_TX_MONITOR = False
@@ -1601,7 +1601,7 @@ async def run():
     elif RACE_MODE:
         mode_str = "🏁 تنافسي (Race)"
     else:
-        mode_str = "🕐 عادي"
+        mode_str = "⚡ خاطف (Ultra Fast / Fast-First)"
     welcome_msg = (
         f"🚀 <b>تم تشغيل نظام المينت الموحد!</b>\n\n"
         f"⚙️ الوضع: <b>{mode_str}</b>\n"
