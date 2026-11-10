@@ -45,13 +45,18 @@ FREE_RPC_POOLS = {
         "https://rpc.mainnet.arc.io",
         "https://rpc.drpc.mainnet.arc.io",
     ],
+    # Elysium Mainnet — public RPCs; Atlantis/1338 is testnet and excluded.
+    "elysium": [
+        "https://rpc.elysiumchain.tech",
+        "https://rpc.elysiumchain.us",
+    ],
 }
 
 _rpc_cycles: dict[str, itertools.cycle] = {}
 _rpc_cycle_locks: dict[str, threading.Lock] = {}
 _rpc_health: dict[str, tuple[float, int]] = {}
 _rpc_health_lock = threading.Lock()
-CHAIN_NAME_BY_ID = {1: "ethereum", 4663: "robinhood", 57073: "ink", 5042: "arc"}
+CHAIN_NAME_BY_ID = {1: "ethereum", 4663: "robinhood", 57073: "ink", 5042: "arc", 1339: "elysium"}
 REQUIRE_MINT_STATS = True
 REQUIRE_OWNERSHIP_CHECK = True
 
@@ -200,6 +205,19 @@ CHAINS_CONFIG = {
         "native_decimals": 18,
         "native_price_usd": 1.0,
         "explorer_url": "https://explorer.arc.io/tx/{tx}",
+    },
+    "elysium": {
+        "rpc_env_var": "ELYSIUM_RPC_URL",
+        "chain_id": 1339,
+        # لا يوجد SeaDrop القياسي على Elysium عند العنوان العالمي؛ الشراء هنا عبر OpenSea API فقط.
+        "seadrop_address": None,
+        "requires_opensea_api": True,
+        "chain_name_display": "Elysium Mainnet",
+        "native_currency": "ELY",
+        "native_decimals": 18,
+        # Conservative fixed reference used only for the gas-cap calculation.
+        "native_price_usd": 1.0,
+        "explorer_url": "https://explorer.elysiumchain.tech/tx/{tx}",
     },
 }
 
@@ -1450,6 +1468,19 @@ def execute_purchase_pipeline(
 
     fast_attempted = False
     fast_failure_reason = ""
+
+    # Elysium لا يستخدم SeaDrop القياسي؛ لا نحاول استدعاء عنوان غير موجود.
+    # OpenSea يعيد target/calldata/value للمرحلة الحالية، ثم نتحقق منها بمحاكاة on-chain.
+    if chain_name == "elysium":
+        if not slug or not opensea_api_key:
+            return {"success": False, "reason": "elysium_opensea_api_required", "attempt_mode": "elysium_api_only"}
+        result = attempt_purchase_drop_api(
+            w3, private_key, wallet_address, slug, opensea_api_key,
+            decide_quantity(max_per_wallet, remaining_supply), eth_price_usd,
+            wait_for_receipt=False,
+        )
+        result.setdefault("attempt_mode", "elysium_api_only")
+        return result
 
     # لم يتم بث معاملة: الآن فقط نتحقق من المرحلة والسعر on-chain.
     drop_info = get_drop_info(w3, nft_contract, seadrop_address)

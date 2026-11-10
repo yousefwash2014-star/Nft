@@ -112,7 +112,7 @@ class AsyncRateLimiter:
 
 
 # الشبكات ثابتة داخل الإصدار؛ روابط RPC والمفاتيح الخاصة فقط من الاستضافة.
-DEFAULT_CHAINS = "ethereum,robinhood,ink,arc"
+DEFAULT_CHAINS = "ethereum,robinhood,ink,arc,elysium"
 ENABLED_CHAINS_LIST = split_csv(DEFAULT_CHAINS)
 
 
@@ -121,6 +121,7 @@ _ALL_CHAIN_CONFIG = {
     "robinhood": {"chain_id": 4663,  "name": "Robinhood Chain",  "native": "ETH"},
     "ink":       {"chain_id": 57073, "name": "Ink",              "native": "ETH"},
     "arc":       {"chain_id": 5042,  "name": "ARC",              "native": "USDC"},
+    "elysium":   {"chain_id": 1339,  "name": "Elysium Mainnet",   "native": "ELY"},
     "polygon":   {"chain_id": 137,   "name": "Polygon Mainnet",  "native": "POL"},
 }
 
@@ -148,13 +149,15 @@ def load_rpc_pools():
         "robinhood": ("ROBINHOOD_RPC_URLS", "ROBINHOOD_RPC_URL"),
         "ink":       ("INK_RPC_URLS",       "INK_RPC_URL"),
         "arc":       ("ARC_RPC_URLS",       "ARC_RPC_URL"),
+        "elysium":   ("ELYSIUM_RPC_URLS",   "ELYSIUM_RPC_URL"),
         "polygon":   ("POLYGON_RPC_URLS",   "POLYGON_RPC_URL"),
     }
     pools = {}
     for name, (multi, single) in specs.items():
         if name not in ENABLED_CHAINS_LIST:
             continue
-        urls = split_csv(os.getenv(multi, ""))
+        urls = (['https://rpc.elysiumchain.tech', 'https://rpc.elysiumchain.us']
+                if name == 'elysium' else split_csv(os.getenv(multi, "")))
         for u in split_csv(os.getenv(single, "")):
             if u not in urls:
                 urls.append(u)
