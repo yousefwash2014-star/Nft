@@ -145,13 +145,13 @@ async def get_next_opensea_key() -> str:
 # ===================================================================
 # ⚙️ متغيرات التشغيل
 # ===================================================================
-BOT_ENABLED = os.environ.get("BOT_ENABLED", "false").strip().lower() == "true"
-CHECK_TWITTER = os.environ.get("CHECK_TWITTER", "false").strip().lower() == "true"
-ENABLE_UNIVERSAL_MINTS = True
+BOT_ENABLED = True  # الأسرار فقط من بيئة الاستضافة
+CHECK_TWITTER = False
+ENABLE_UNIVERSAL_MINTS = False
 TELEGRAM_NOTIFY_FAILURES = False
 VERIFY_ONCHAIN_PRICE = True
-SKIP_BALANCE_CHECK_RACE = True
-FIXED_GAS_LIMIT = 185000
+SKIP_BALANCE_CHECK_RACE = False
+FIXED_GAS_LIMIT = 0
 FAST_SUBMIT_MODE = SKIP_BALANCE_CHECK_RACE and FIXED_GAS_LIMIT > 0
 NOTIFY_SCHEDULED = False
 # عند تعطيله، لا تُنشأ مهام للمراحل المستقبلية؛ ينتظر الماسح/الـ Stream حتى تصبح Public مفتوحة.
@@ -162,17 +162,17 @@ DROPS_API_BASE = "https://api.opensea.io/api/v2/drops"
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 LOCAL_TZ = timezone(timedelta(hours=3))
 
-PERFORMANCE_PROFILE = "ultra"
+PERFORMANCE_PROFILE = "turbo-safe"
 TURBO_MODE = PERFORMANCE_PROFILE in {"turbo", "fast", "speed", "ultra"}
 ULTRA_MODE = PERFORMANCE_PROFILE == "ultra"
-MAX_CONCURRENT_MINTS = 40
+MAX_CONCURRENT_MINTS = 32
 HEARTBEAT_INTERVAL = 30
 RECV_TIMEOUT = 1.0
 FREE_PRICE_THRESHOLD_USD = 0.00015
-SCAN_INTERVAL = 0.25
-MAX_RETRY_HOURS = 6.0
-MAX_RETRY_ATTEMPTS = 2
-PENDING_TX_MONITOR = False
+SCAN_INTERVAL = 0.35
+MAX_RETRY_HOURS = 0.0
+MAX_RETRY_ATTEMPTS = 0
+PENDING_TX_MONITOR = True
 PENDING_TX_MAX_INFLIGHT = 32
 
 
@@ -309,6 +309,8 @@ RPC_URLS_BY_CHAIN = {
     "robinhood": _csv_env("ROBINHOOD_RPC_URLS", "ROBINHOOD_RPC_URL"),
     "arc": _csv_env("ARC_RPC_URLS", "ARC_RPC_URL"),
     "ink": _csv_env("INK_RPC_URLS", "INK_RPC_URL"),
+    # Elysium is embedded in the application; no hosting variable required.
+    "elysium": ["https://rpc.elysiumchain.tech", "https://rpc.elysiumchain.us"],
 }
 
 def _wss_urls(chain_key: str, env_name: str, alchemy_key: str = "") -> list[str]:
@@ -325,6 +327,7 @@ WSS_URLS_BY_CHAIN = {
     "robinhood": _wss_urls("robinhood", "ROBINHOOD_WSS_URLS", ALCHEMY_KEY_ROBINHOOD),
     "arc": _csv_env("ARC_WSS_URLS"),
     "ink": _csv_env("INK_WSS_URLS"),
+    "elysium": ["wss://ws.elysiumchain.tech"],
 }
 
 for chain_key, rpc_urls in RPC_URLS_BY_CHAIN.items():
@@ -375,7 +378,7 @@ for chain_key, cfg in CHAINS_CONFIG.items():
 STREAM_NAME_TO_CHAIN_KEY = {
     "ethereum": "ethereum", "eth": "ethereum",
     "robinhood": "robinhood",
-    "ink": "ink", "arc": "arc",
+    "ink": "ink", "arc": "arc", "elysium": "elysium",
 }
 
 # عقود اكتشفها OpenSea/REST؛ لا تتم مراقبة pending لعقود مجهولة عشوائياً.
@@ -760,7 +763,7 @@ class OpenSeaRateLimiter:
             log.info("[Rate Limiter] تعافٍ → %.2f req/s", self._rate)
 
 
-OPENSEA_RATE_PER_KEY = float(os.environ.get("OPENSEA_RATE_PER_KEY", "1.5"))
+OPENSEA_RATE_PER_KEY = 3.0
 _opensea_limiter = OpenSeaRateLimiter(
     rate_per_second=max(1.0, OPENSEA_RATE_PER_KEY * max(1, len(OPENSEA_API_KEYS)))
 )
@@ -1254,7 +1257,7 @@ async def evaluate_and_execute_mint(session: aiohttp.ClientSession, slug: str, c
             return
         register_mint_contract(chain_key, slug, contract_address)
 
-        if VERIFY_ONCHAIN_PRICE:
+        if VERIFY_ONCHAIN_PRICE and chain_key != "elysium":
             onchain_price = await asyncio.to_thread(
                 get_onchain_public_price_wei, w3, contract_address,
                 CHAINS_CONFIG[chain_key]["seadrop_address"]

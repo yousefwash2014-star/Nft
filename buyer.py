@@ -45,13 +45,18 @@ FREE_RPC_POOLS = {
         "https://rpc.mainnet.arc.io",
         "https://rpc.drpc.mainnet.arc.io",
     ],
+    # Elysium Mainnet — public RPCs; Atlantis/1338 is testnet and excluded.
+    "elysium": [
+        "https://rpc.elysiumchain.tech",
+        "https://rpc.elysiumchain.us",
+    ],
 }
 
 _rpc_cycles: dict[str, itertools.cycle] = {}
 _rpc_cycle_locks: dict[str, threading.Lock] = {}
 _rpc_health: dict[str, tuple[float, int]] = {}
 _rpc_health_lock = threading.Lock()
-CHAIN_NAME_BY_ID = {1: "ethereum", 4663: "robinhood", 57073: "ink", 5042: "arc"}
+CHAIN_NAME_BY_ID = {1: "ethereum", 4663: "robinhood", 57073: "ink", 5042: "arc", 1339: "elysium"}
 REQUIRE_MINT_STATS = True
 REQUIRE_OWNERSHIP_CHECK = True
 
@@ -148,8 +153,11 @@ class _RpcRateLimiter:
             time.sleep(wait)
 
 
-_rpc_limiter = _RpcRateLimiter(rate=float(os.environ.get("RPC_RATE_LIMIT", "18")))
-_rpc_limiter_fast = _RpcRateLimiter(rate=float(os.environ.get("RPC_FAST_RATE_LIMIT", "40")))
+# إعدادات ثابتة: لا تُقرأ من بيئة التشغيل حتى لا تتغير سياسة الإرسال بالخطأ.
+RPC_RATE_LIMIT = 24.0
+RPC_FAST_RATE_LIMIT = 60.0
+_rpc_limiter = _RpcRateLimiter(rate=RPC_RATE_LIMIT)
+_rpc_limiter_fast = _RpcRateLimiter(rate=RPC_FAST_RATE_LIMIT)
 _mint_api_local = threading.local()
 
 def _mint_api_session():
@@ -197,6 +205,19 @@ CHAINS_CONFIG = {
         "native_decimals": 18,
         "native_price_usd": 1.0,
         "explorer_url": "https://explorer.arc.io/tx/{tx}",
+    },
+    "elysium": {
+        "rpc_env_var": "ELYSIUM_RPC_URL",
+        "chain_id": 1339,
+        # لا يوجد SeaDrop القياسي على Elysium عند العنوان العالمي؛ الشراء هنا عبر OpenSea API فقط.
+        "seadrop_address": None,
+        "requires_opensea_api": True,
+        "chain_name_display": "Elysium Mainnet",
+        "native_currency": "ELY",
+        "native_decimals": 18,
+        # Conservative fixed reference used only for the gas-cap calculation.
+        "native_price_usd": 1.0,
+        "explorer_url": "https://explorer.elysiumchain.tech/tx/{tx}",
     },
 }
 
@@ -280,23 +301,23 @@ LIMITED_BUY_QTY = 50
 GAS_LIMIT_SAFETY_MARGIN = 1.2
 MAX_ETH_PER_TX = 0
 SKIP_BALANCE_CHECK_RACE = True
-FIXED_GAS_LIMIT = 185000
+FIXED_GAS_LIMIT = 0  # تقدير الغاز ديناميكيًا قبل التوقيع لتفادي فشل out-of-gas
 FAST_SUBMIT_MODE = SKIP_BALANCE_CHECK_RACE and FIXED_GAS_LIMIT > 0
 FAST_FIRST_ENABLED = True
 
 RACE_MODE = False
-RACE_GAS_BOOST = float(os.environ.get("RACE_GAS_BOOST", "1.35"))
+RACE_GAS_BOOST = 1.35
 RACE_MAX_ATTEMPTS = 1
-RACE_RETRY_DELAY_MS = int(os.environ.get("RACE_RETRY_DELAY_MS", "120") or "120")
-RACE_PRE_SUBMIT_SECONDS = float(os.environ.get("RACE_PRE_SUBMIT_SECONDS", "0.6"))
+RACE_RETRY_DELAY_MS = 120
+RACE_PRE_SUBMIT_SECONDS = 0.6
 
 # الحماية الافتراضية: معاملة واحدة لكل محفظة/مينت.
 ALLOW_MULTIPLE_TX_PER_MINT = False
 RACE_CASCADE_ENABLED = False
 RACE_CASCADE_SIZE = 1
-RACE_CASCADE_DELAY_MS = max(0, int(os.environ.get("RACE_CASCADE_DELAY_MS", "35") or "35"))
-RACE_CASCADE_GAS_STEP = float(os.environ.get("RACE_CASCADE_GAS_STEP", "1.18") or "1.18")
-RACE_MAX_WORKERS = max(1, int(os.environ.get("RACE_MAX_WORKERS", "8") or "8"))
+RACE_CASCADE_DELAY_MS = 35
+RACE_CASCADE_GAS_STEP = 1.18
+RACE_MAX_WORKERS = 8
 
 # ===========================================================================
 # 💰 Gas Caps لكل سلسلة
@@ -332,10 +353,8 @@ log.info(
     ", ".join(f"{k}=${v:.2f}" for k, v in CHAIN_GAS_CAPS.items()),
 )
 
-RETRYABLE_REASONS = {
-    "gas_too_high", "gas_too_high_precise", "tx_error",
-    "simulation_failed", "no_fee_recipient", "race_not_started",
-}
+# لا توجد إعادة محاولة تلقائية بعد فشل الإرسال؛ يمنع استنزاف الغاز.
+RETRYABLE_REASONS = set()
 
 # ===========================================================================
 # Nonce Lock
@@ -367,8 +386,8 @@ _gas_price_cache_lock = threading.Lock()
 GAS_PRICE_CACHE_TTL = 5
 _nonce_cache: dict[str, tuple[float, int]] = {}
 _nonce_cache_lock = threading.Lock()
-NONCE_CACHE_TTL = max(0.5, float(os.environ.get("NONCE_CACHE_TTL", "8")))
-PREFETCH_NONCE = os.environ.get("PREFETCH_NONCE", "true").strip().lower() == "true"
+NONCE_CACHE_TTL = 2.0
+PREFETCH_NONCE = True
 
 def get_cached_pending_nonce(w3: Web3, wallet_address: str, force_refresh: bool = False) -> int:
     chain_id = int(w3.eth.chain_id)
@@ -1019,6 +1038,20 @@ def race_all_wallets(w3: Web3, plans: list[RacePlan]) -> list[dict]:
 # ===========================================================================
 # الشراء الكلاسيكي
 # ===========================================================================
+def _simulate_transaction_before_broadcast(w3: Web3, tx: dict) -> int:
+    """محاكاة إلزامية على نفس from/to/data/value قبل توقيع أي معاملة."""
+    call_tx = {
+        "from": tx.get("from"),
+        "to": tx.get("to"),
+        "data": tx.get("data", "0x"),
+        "value": int(tx.get("value", 0) or 0),
+    }
+    _rpc_limiter_fast.acquire()
+    w3.eth.call(call_tx, "pending")
+    _rpc_limiter_fast.acquire()
+    return int(w3.eth.estimate_gas(call_tx))
+
+
 def attempt_purchase_seadrop(
     w3: Web3, private_key: str, wallet_address: str,
     nft_contract: str, seadrop_address: str,
@@ -1139,6 +1172,12 @@ def attempt_purchase_seadrop(
                 tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
             except Exception as e:
                 return {"success": False, "reason": "simulation_failed", "error": str(e)}
+
+        try:
+            simulated_gas = _simulate_transaction_before_broadcast(w3, tx)
+            tx["gas"] = max(21_000, int(simulated_gas * GAS_LIMIT_SAFETY_MARGIN))
+        except Exception as simulation_error:
+            return {"success": False, "reason": "simulation_failed", "error": str(simulation_error)}
 
         gas_fee_eth = (tx["gas"] * priority_gas_price) / 1e18
         gas_fee_usd_actual = gas_fee_eth * eth_price_usd
@@ -1368,6 +1407,11 @@ def attempt_purchase_drop_api(
         else:
             _rpc_limiter.acquire()
             tx["gas"] = int(w3.eth.estimate_gas(tx) * GAS_LIMIT_SAFETY_MARGIN)
+        try:
+            simulated_gas = _simulate_transaction_before_broadcast(w3, tx)
+            tx["gas"] = max(21_000, int(simulated_gas * GAS_LIMIT_SAFETY_MARGIN))
+        except Exception as simulation_error:
+            return {"success": False, "reason": "simulation_failed", "error": str(simulation_error)}
         gas_fee_usd = tx["gas"] * gas_price / 1e18 * eth_price_usd
         if gas_fee_usd > MAX_GAS_FEE_USD:
             return {"success": False, "reason": "gas_too_high_precise", "gas_fee_usd": gas_fee_usd}
@@ -1414,7 +1458,7 @@ def execute_purchase_pipeline(
     eth_price_usd: float, allow_universal: bool = True,
     slug: str = "", opensea_api_key: str = "",
 ) -> dict:
-    """المسار الآمن: Fast broadcast أولاً، ثم الفحوص فقط عند فشل ما قبل البث."""
+    """المسار الآمن: فحوص on-chain أولاً، ثم Fast broadcast بعد محاكاة ناجحة."""
     balance_usd = -1.0
     gas_fee_usd = 0.0
     try:
@@ -1425,26 +1469,18 @@ def execute_purchase_pipeline(
     fast_attempted = False
     fast_failure_reason = ""
 
-    # Fast-first افتراضيًا: لا get_drop_info ولا balanceOf ولا getMintStats
-    # قبل محاولة OpenSea. عند فشل البث نكمل تلقائيًا بالمسار العادي.
-    # OpenSea يعيد calldata/target/value للمرحلة المؤهلة؛ نتحقق من value داخل المرسل.
-    if FAST_FIRST_ENABLED and slug and opensea_api_key:
-        fast_attempted = True
-        log.info("⚡ Fast-first: محاولة الشراء الخاطفة أولاً للمجموعة %s", slug)
-        fast_result = attempt_purchase_drop_api(
+    # Elysium لا يستخدم SeaDrop القياسي؛ لا نحاول استدعاء عنوان غير موجود.
+    # OpenSea يعيد target/calldata/value للمرحلة الحالية، ثم نتحقق منها بمحاكاة on-chain.
+    if chain_name == "elysium":
+        if not slug or not opensea_api_key:
+            return {"success": False, "reason": "elysium_opensea_api_required", "attempt_mode": "elysium_api_only"}
+        result = attempt_purchase_drop_api(
             w3, private_key, wallet_address, slug, opensea_api_key,
             decide_quantity(max_per_wallet, remaining_supply), eth_price_usd,
             wait_for_receipt=False,
         )
-        if fast_result.get("reason") == "tx_pending" or fast_result.get("tx_hash"):
-            fast_result["balance_usd"] = balance_usd
-            fast_result["attempt_mode"] = "fast_broadcast"
-            return fast_result
-        fast_failure_reason = fast_result.get("reason", "unknown")
-        log.info(
-            "↩️ Fast-first لم يبث معاملة للمجموعة %s (%s) — الانتقال للمسار العادي",
-            slug, fast_failure_reason,
-        )
+        result.setdefault("attempt_mode", "elysium_api_only")
+        return result
 
     # لم يتم بث معاملة: الآن فقط نتحقق من المرحلة والسعر on-chain.
     drop_info = get_drop_info(w3, nft_contract, seadrop_address)
@@ -1463,6 +1499,23 @@ def execute_purchase_pipeline(
             "attempt_mode": "normal_checked",
         }
     price_wei = 0
+
+    # Fast-first الآمن: لا يبدأ إلا بعد التحقق من المرحلة والسعر on-chain.
+    # attempt_purchase_drop_api ينفذ eth_call وestimate_gas قبل أي broadcast.
+    if FAST_FIRST_ENABLED and slug and opensea_api_key:
+        fast_attempted = True
+        log.info("⚡ Fast-safe: محاكاة ثم إرسال OpenSea للمجموعة %s", slug)
+        fast_result = attempt_purchase_drop_api(
+            w3, private_key, wallet_address, slug, opensea_api_key,
+            decide_quantity(max_per_wallet, remaining_supply), eth_price_usd,
+            wait_for_receipt=False,
+        )
+        if fast_result.get("reason") == "tx_pending" or fast_result.get("tx_hash"):
+            fast_result["balance_usd"] = balance_usd
+            fast_result["attempt_mode"] = "fast_safe_broadcast"
+            return fast_result
+        fast_failure_reason = fast_result.get("reason", "unknown")
+        log.info("↩️ Fast-safe لم يبث للمجموعة %s (%s) — المسار العادي", slug, fast_failure_reason)
 
     # بعد فشل Fast وقبل أي بث عادي، لا نتجاوز الفحوص حتى لو كان
     # SKIP_BALANCE_CHECK_RACE مفعلاً؛ ذلك الخيار خاص بالمسار التنافسي فقط.
@@ -1500,7 +1553,8 @@ def execute_purchase_pipeline(
         result["attempt_mode"] = "normal_fallback"
         result["fast_failure_reason"] = fast_failure_reason
 
-    if (not result.get("success") and allow_universal and
+    # ممنوع إرسال ABI بديل بعد محاولة SeaDrop؛ قد تكون المعاملة الأولى وصلت للسلسلة.
+    if False and (not result.get("success") and allow_universal and
         result.get("reason") in ("tx_error", "simulation_failed", "reverted") and
         is_free_or_negligible(price_wei, eth_price_usd)):
         qty = decide_quantity(max_per_wallet, remaining_supply)

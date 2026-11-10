@@ -42,8 +42,12 @@ def test_final_reasons_in_main():
     assert "not_started" in BUYER
 
 
-def test_env_defaults():
-    assert "ENABLE_UNIVERSAL_MINTS=true" in ENV
+def test_embedded_safe_defaults():
+    assert "ENABLE_UNIVERSAL_MINTS = False" in MAIN
+    assert "MAX_RETRY_ATTEMPTS = 0" in MAIN
+    assert "PENDING_TX_MONITOR = True" in MAIN
+    assert "RETRYABLE_REASONS = set()" in BUYER
+    assert "_simulate_transaction_before_broadcast" in BUYER
 
 
 def test_rpc_rotation_in_buyer():

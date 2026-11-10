@@ -25,7 +25,7 @@ assert "REQUIRE_OWNERSHIP_CHECK" in buyer
 assert "get_wallet_ownership_balance" in buyer
 print("configuration checks passed")
 assert "schedule_evaluation" in main
-assert "PERFORMANCE_PROFILE=turbo" in env
+assert "PERFORMANCE_PROFILE" in main and "turbo-safe" in main
 
 from stage_policy import stage_rejection_reason
 assert stage_rejection_reason({"name": "Public Stage", "type": "public", "allowlist": {"id": "old"}}) is None

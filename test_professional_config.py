@@ -7,6 +7,7 @@ configs = {key: {"chain_id": cid} for key, cid in {
     "robinhood": 4663,
     "ink": 57073,
     "arc": 5042,
+    "elysium": 1339,
 }.items()}
 rpcs = {key: [f"https://{key}.example/rpc"] for key in NETWORK_ORDER}
 assert validate_network_configs(configs, rpcs) == []

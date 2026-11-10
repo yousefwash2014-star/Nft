@@ -18,6 +18,7 @@ NETWORK_REQUIREMENTS: tuple[NetworkRequirement, ...] = (
     NetworkRequirement("robinhood", 4663, "ROBINHOOD"),
     NetworkRequirement("ink", 57073, "INK"),
     NetworkRequirement("arc", 5042, "ARC"),
+    NetworkRequirement("elysium", 1339, "ELYSIUM"),
 )
 NETWORK_ORDER = tuple(item.key for item in NETWORK_REQUIREMENTS)
 EXPECTED_CHAIN_IDS = {item.key: item.chain_id for item in NETWORK_REQUIREMENTS}
