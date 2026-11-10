@@ -44,6 +44,7 @@ def test_final_reasons_in_main():
 
 def test_embedded_safe_defaults():
     assert "ENABLE_UNIVERSAL_MINTS = False" in MAIN
+    assert "CHECK_TWITTER = True" in MAIN
     assert "MAX_RETRY_ATTEMPTS = 0" in MAIN
     assert "PENDING_TX_MONITOR = True" in MAIN
     assert "RETRYABLE_REASONS = set()" in BUYER

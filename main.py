@@ -146,7 +146,7 @@ async def get_next_opensea_key() -> str:
 # ⚙️ متغيرات التشغيل
 # ===================================================================
 BOT_ENABLED = True  # الأسرار فقط من بيئة الاستضافة
-CHECK_TWITTER = False
+CHECK_TWITTER = True  # لا يتم تنفيذ أي منت بدون حساب X مرتبط بالمجموعة
 ENABLE_UNIVERSAL_MINTS = False
 TELEGRAM_NOTIFY_FAILURES = False
 VERIFY_ONCHAIN_PRICE = True
