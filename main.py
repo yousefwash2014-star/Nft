@@ -170,6 +170,17 @@ HEARTBEAT_INTERVAL = 30
 RECV_TIMEOUT = 1.0
 FREE_PRICE_THRESHOLD_USD = 0.00015
 SCAN_INTERVAL = 0.35
+# Elysium تعتمد على Sequencer واحد ولا تقدم mempool pending موثوقًا.
+ELYSIUM_SCAN_INTERVAL = 0.20
+ELYSIUM_PENDING_MONITOR = False
+# إعادة المحاولة الآمنة: قبل البث فقط، ولا تعمل أبدًا على tx_pending.
+ELYSIUM_AUTO_RETRY_ATTEMPTS = 2
+ELYSIUM_AUTO_RETRY_BASE_DELAY = 0.35
+TRANSIENT_RETRY_MARKERS = (
+    "timeout", "timed out", "429", "503", "502", "temporarily",
+    "service unavailable", "connection reset", "connection aborted",
+    "rate limit", "too many requests", "gateway",
+)
 MAX_RETRY_HOURS = 0.0
 MAX_RETRY_ATTEMPTS = 0
 PENDING_TX_MONITOR = True
@@ -1004,6 +1015,18 @@ def build_fail_msg(detail: dict, result: dict, chain_key: str, wallet_name: str)
 # ===================================================================
 # 💼 تنفيذ الشراء (الوضع الكلاسيكي)
 # ===================================================================
+def _is_safe_prebroadcast_retry(result: dict) -> bool:
+    """لا يعيد المحاولة إلا لأخطاء RPC المؤقتة قبل قبول المعاملة."""
+    if not isinstance(result, dict) or result.get("reason") in {"success", "tx_pending"}:
+        return False
+    reason = str(result.get("reason", "")).lower()
+    error = str(result.get("error", "")).lower()
+    if reason not in {"simulation_failed", "tx_error", "drop_mint_api_unavailable"}:
+        return False
+    text = f"{reason} {error}"
+    return any(marker in text for marker in TRANSIENT_RETRY_MARKERS)
+
+
 async def execute_wallet_task(
     w3, item: dict, slug: str, chain_key: str, contract_address: str,
     seadrop_address: str, price_wei: int, max_per_wallet: Optional[int],
@@ -1031,13 +1054,31 @@ async def execute_wallet_task(
 
     opensea_key = await get_next_opensea_key()
     execution_t0 = time.perf_counter()
+    retry_count = 0
+    max_prebroadcast_retries = ELYSIUM_AUTO_RETRY_ATTEMPTS if chain_key == "elysium" else 1
     async with semaphore:
-        result = await asyncio.to_thread(
-            execute_purchase_pipeline,
-            w3, pk, wallet_addr, contract_address, seadrop_address,
-            price_wei, max_per_wallet, remaining, eth_price_usd,
-            ENABLE_UNIVERSAL_MINTS, slug, opensea_key
-        )
+        while True:
+            result = await asyncio.to_thread(
+                execute_purchase_pipeline,
+                w3, pk, wallet_addr, contract_address, seadrop_address,
+                price_wei, max_per_wallet, remaining, eth_price_usd,
+                ENABLE_UNIVERSAL_MINTS, slug, opensea_key
+            )
+            # tx_pending يعني أن البث تم أو أن RPC يعرف المعاملة؛ ممنوع التكرار.
+            if (
+                retry_count >= max_prebroadcast_retries
+                or not _is_safe_prebroadcast_retry(result)
+                or result.get("reason") == "tx_pending"
+            ):
+                break
+            retry_count += 1
+            delay = ELYSIUM_AUTO_RETRY_BASE_DELAY * retry_count
+            log.warning(
+                "🔁 إعادة محاولة آمنة %d/%d لـ %s بعد خطأ RPC مؤقت؛ الانتظار %.2fs",
+                retry_count, max_prebroadcast_retries, slug, delay,
+            )
+            await asyncio.sleep(delay)
+    result["prebroadcast_retry_count"] = retry_count
     result["wallet"] = wallet_addr
     result["wallet_name"] = w_name
     result["latency_ms"] = round((time.perf_counter() - execution_t0) * 1000, 1)
@@ -1441,7 +1482,7 @@ async def fast_active_scanner():
                         schedule_evaluation(session, slug, chain_key)
             except Exception as e:
                 log.error(f"خطأ الماسح: {e}")
-            await asyncio.sleep(SCAN_INTERVAL)
+            await asyncio.sleep(ELYSIUM_SCAN_INTERVAL if "elysium" in ENABLED_CHAINS else SCAN_INTERVAL)
 
 
 # ===================================================================
@@ -1605,12 +1646,18 @@ async def run():
         mode_str = "🏁 تنافسي (Race)"
     else:
         mode_str = "🕐 عادي"
+    x_bearer_configured = bool(os.environ.get("TWITTER_BEARER_TOKEN", "").strip())
+    x_status = "مفعّل" if CHECK_TWITTER else "معطّل"
+    x_api_status = "مفعّل" if x_bearer_configured else "غير مفعّل — فحص ارتباط OpenSea فقط"
     welcome_msg = (
         f"🚀 <b>تم تشغيل نظام المينت الموحد!</b>\n\n"
         f"⚙️ الوضع: <b>{mode_str}</b>\n"
         f"📡 الشبكات: {esc(chains_str)}\n"
         f"👛 المحافظ: {len(WALLETS_DATA)}\n"
         f"🔑 مفاتيح OpenSea: {len(OPENSEA_API_KEYS)}\n"
+        f"𝕏 فحص X: <b>{x_status}</b>\n"
+        f"𝕏 فحص X API المتقدم: <b>{x_api_status}</b>\n"
+        f"🔁 إعادة Elysium قبل البث: <b>{ELYSIUM_AUTO_RETRY_ATTEMPTS} محاولات</b>\n"
         f"📨 إشعارات الجدولة: {'مفعّلة' if NOTIFY_SCHEDULED else 'معطّلة'}\n"
         f"📨 إشعارات الفشل: {'مفعّلة' if TELEGRAM_NOTIFY_FAILURES else 'معطّلة'}"
     )
@@ -1623,6 +1670,9 @@ async def run():
     monitor_tasks = []
     if PENDING_TX_MONITOR:
         for chain_key in ENABLED_CHAINS:
+            if chain_key == "elysium" and not ELYSIUM_PENDING_MONITOR:
+                log.info("🔕 Elysium pending monitor disabled: الشبكة لا تقدم mempool pending موثوقًا")
+                continue
             monitor = PendingTxMonitor(
                 chain_key,
                 WSS_URLS_BY_CHAIN.get(chain_key, []),

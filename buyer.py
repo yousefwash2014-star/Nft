@@ -1397,16 +1397,12 @@ def attempt_purchase_drop_api(
         wallet = Web3.to_checksum_address(wallet_address)
         nonce = get_cached_pending_nonce(w3, wallet, force_refresh=True)
         gas_price = int(get_cached_gas_price(w3) or w3.eth.gas_price)
-        gas_price = int(gas_price * 1.10)
+        # لا توجد منافسة mempool عامة على Elysium؛ لا نضيف bump غير ضروري للغاز.
+        gas_price = int(gas_price * (1.0 if int(w3.eth.chain_id) == 1339 else 1.10))
         tx = {"from": wallet, "to": target, "data": tx_data["calldata"],
               "value": 0, "nonce": nonce, "gasPrice": gas_price,
               "chainId": int(w3.eth.chain_id)}
-        # OpenSea Mint API قد يحتاج غازًا أكبر عند طلب كمية كبيرة.
-        if FIXED_GAS_LIMIT > 0 and quantity <= FEW_THRESHOLD:
-            tx["gas"] = FIXED_GAS_LIMIT
-        else:
-            _rpc_limiter.acquire()
-            tx["gas"] = int(w3.eth.estimate_gas(tx) * GAS_LIMIT_SAFETY_MARGIN)
+        # محاكاة واحدة تجمع eth_call وestimate_gas؛ لا نكرر estimate_gas قبلها.
         try:
             simulated_gas = _simulate_transaction_before_broadcast(w3, tx)
             tx["gas"] = max(21_000, int(simulated_gas * GAS_LIMIT_SAFETY_MARGIN))

@@ -45,10 +45,17 @@ def test_final_reasons_in_main():
 def test_embedded_safe_defaults():
     assert "ENABLE_UNIVERSAL_MINTS = False" in MAIN
     assert "CHECK_TWITTER = True" in MAIN
+    assert "فحص X" in MAIN
     assert "MAX_RETRY_ATTEMPTS = 0" in MAIN
     assert "PENDING_TX_MONITOR = True" in MAIN
     assert "RETRYABLE_REASONS = set()" in BUYER
     assert "_simulate_transaction_before_broadcast" in BUYER
+    assert "ELYSIUM_SCAN_INTERVAL = 0.20" in MAIN
+    assert "ELYSIUM_PENDING_MONITOR = False" in MAIN
+    assert "Elysium pending monitor disabled" in MAIN
+    assert "ELYSIUM_AUTO_RETRY_ATTEMPTS = 2" in MAIN
+    assert "_is_safe_prebroadcast_retry" in MAIN
+    assert "prebroadcast_retry_count" in MAIN
 
 
 def test_rpc_rotation_in_buyer():
