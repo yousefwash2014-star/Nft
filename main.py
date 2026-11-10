@@ -309,8 +309,6 @@ RPC_URLS_BY_CHAIN = {
     "robinhood": _csv_env("ROBINHOOD_RPC_URLS", "ROBINHOOD_RPC_URL"),
     "arc": _csv_env("ARC_RPC_URLS", "ARC_RPC_URL"),
     "ink": _csv_env("INK_RPC_URLS", "INK_RPC_URL"),
-    # Elysium is embedded in the application; no hosting variable required.
-    "elysium": ["https://rpc.elysiumchain.tech", "https://rpc.elysiumchain.us"],
 }
 
 def _wss_urls(chain_key: str, env_name: str, alchemy_key: str = "") -> list[str]:
@@ -327,7 +325,6 @@ WSS_URLS_BY_CHAIN = {
     "robinhood": _wss_urls("robinhood", "ROBINHOOD_WSS_URLS", ALCHEMY_KEY_ROBINHOOD),
     "arc": _csv_env("ARC_WSS_URLS"),
     "ink": _csv_env("INK_WSS_URLS"),
-    "elysium": ["wss://ws.elysiumchain.tech"],
 }
 
 for chain_key, rpc_urls in RPC_URLS_BY_CHAIN.items():
@@ -378,7 +375,7 @@ for chain_key, cfg in CHAINS_CONFIG.items():
 STREAM_NAME_TO_CHAIN_KEY = {
     "ethereum": "ethereum", "eth": "ethereum",
     "robinhood": "robinhood",
-    "ink": "ink", "arc": "arc", "elysium": "elysium",
+    "ink": "ink", "arc": "arc",
 }
 
 # عقود اكتشفها OpenSea/REST؛ لا تتم مراقبة pending لعقود مجهولة عشوائياً.
@@ -1257,7 +1254,7 @@ async def evaluate_and_execute_mint(session: aiohttp.ClientSession, slug: str, c
             return
         register_mint_contract(chain_key, slug, contract_address)
 
-        if VERIFY_ONCHAIN_PRICE and chain_key != "elysium":
+        if VERIFY_ONCHAIN_PRICE:
             onchain_price = await asyncio.to_thread(
                 get_onchain_public_price_wei, w3, contract_address,
                 CHAINS_CONFIG[chain_key]["seadrop_address"]
