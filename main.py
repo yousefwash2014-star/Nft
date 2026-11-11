@@ -620,6 +620,12 @@ async def execute_race(race: ScheduledRace, plans: list[RacePlan]):
                 result.setdefault("attempt_mode", "race")
                 reason = result.get("reason", "")
                 if reason == "tx_pending" and result.get("tx_hash"):
+                    result["wallet"] = plan.wallet_address
+                    enqueue_message(
+                        bot_tok, chat_id,
+                        build_pending_msg(race.detail, result, race.chain_key, wallet_name),
+                        source=f"race-broadcast-pending:{race.slug}",
+                    )
                     pending_transactions[f"{race.chain_key}:{race.slug}:{plan.wallet_address.lower()}"] = {
                         "tx_hash": result["tx_hash"], "chain_key": race.chain_key,
                         "slug": race.slug, "wallet": plan.wallet_address,
@@ -997,6 +1003,25 @@ def build_success_msg(detail: dict, result: dict, chain_key: str, wallet_name: s
     ).strip()
 
 
+def build_pending_msg(detail: dict, result: dict, chain_key: str, wallet_name: str) -> str:
+    name = esc(detail.get("collection_name") or detail.get("collection_slug") or "Unknown")
+    chain_label = esc(CHAINS_CONFIG.get(chain_key, {}).get("chain_name_display", chain_key.upper()))
+    wallet_addr = result.get("wallet", "") or ""
+    w_short = esc(wallet_addr[:6] + "..." + wallet_addr[-4:]) if len(wallet_addr) >= 10 else esc(wallet_addr)
+    tx_hash = result.get("tx_hash", "") or ""
+    tmpl = CHAINS_CONFIG.get(chain_key, {}).get("explorer_url", "")
+    tx_url = tmpl.format(tx=tx_hash) if tmpl and tx_hash else ""
+    tx_link = f'<a href="{esc(tx_url)}">فتح المعاملة</a>' if tx_url else f"<code>{esc(tx_hash)}</code>"
+    return (
+        f"📤 <b>تم بث المعاملة — بانتظار التأكيد</b> ({chain_label})\n\n"
+        f"👤 المحفظة: <b>{esc(wallet_name)}</b> (<code>{w_short}</code>)\n"
+        f"🎨 المجموعة: <b>{name}</b>\n"
+        f"🧾 المعاملة: {tx_link}\n"
+        f"🔑 <code>{esc(tx_hash)}</code>\n"
+        f"ℹ️ سيتم إرسال إشعار نجاح بعد تأكيد الشبكة."
+    )
+
+
 def build_fail_msg(detail: dict, result: dict, chain_key: str, wallet_name: str) -> str:
     name = esc(detail.get("collection_name") or detail.get("collection_slug") or "Unknown")
     chain_label = esc(CHAINS_CONFIG.get(chain_key, {}).get("chain_name_display", chain_key.upper()))
@@ -1096,6 +1121,10 @@ async def execute_wallet_task(
     else:
         reason = result.get("reason", "")
         if reason == "tx_pending" and result.get("tx_hash"):
+            enqueue_message(
+                bot_tok, chat_id, build_pending_msg(detail, result, chain_key, w_name),
+                source=f"broadcast-pending:{slug}",
+            )
             pending_transactions[pending_key] = {
                 "tx_hash": result["tx_hash"], "chain_key": chain_key,
                 "slug": slug, "wallet": wallet_addr,
@@ -1355,7 +1384,14 @@ async def evaluate_and_execute_mint(session: aiohttp.ClientSession, slug: str, c
             )
             for w in pending_wallets
         ]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        task_results = await asyncio.gather(*tasks, return_exceptions=True)
+        for wallet, task_result in zip(pending_wallets, task_results):
+            if isinstance(task_result, Exception):
+                log.error(
+                    "❌ استثناء غير معالج في مهمة المحفظة %s/%s: %s",
+                    chain_key, wallet.get("name", wallet.get("address", "?")), task_result,
+                    exc_info=(type(task_result), task_result, task_result.__traceback__),
+                )
 
     except Exception as e:
         log.error(f"خطأ تقييم '{slug}': {e}")
@@ -1577,7 +1613,23 @@ async def reconcile_pending_transactions():
                 elif status == 0:
                     pending_transactions.pop(key, None)
                     release_wallet_operation(item["chain_key"], item["slug"], item["wallet"])
-                    log.warning("⚠️ فشلت المعاملة المعلّقة؛ سيسمح بإعادة المحاولة: %s", item["tx_hash"])
+                    failed_result = {
+                        "success": False,
+                        "reason": "tx_reverted",
+                        "tx_hash": item["tx_hash"],
+                        "error": "transaction reverted on-chain",
+                        "wallet": item["wallet"],
+                        "attempt_mode": item.get("attempt_mode", "confirmed"),
+                    }
+                    enqueue_message(
+                        item.get("bot_token", ""), item.get("chat_id", ""),
+                        build_fail_msg(
+                            item.get("detail", {}), failed_result,
+                            item["chain_key"], item.get("wallet_name", "المحفظة"),
+                        ),
+                        source=f"confirmed-failure:{item['slug']}",
+                    )
+                    log.warning("⚠️ فشلت المعاملة المعلّقة؛ أُرسل إشعار الفشل: %s", item["tx_hash"])
             except Exception:
                 # لا نحذف السجل عند فشل RPC؛ الإرسال السابق قد يكون ما زال صالحًا.
                 continue
@@ -1658,6 +1710,7 @@ async def run():
         f"𝕏 فحص X: <b>{x_status}</b>\n"
         f"𝕏 فحص X API المتقدم: <b>{x_api_status}</b>\n"
         f"🔁 إعادة Elysium قبل البث: <b>{ELYSIUM_AUTO_RETRY_ATTEMPTS} محاولات</b>\n"
+        f"📤 إشعار البث والتأكيد: <b>مفعّل</b>\n"
         f"📨 إشعارات الجدولة: {'مفعّلة' if NOTIFY_SCHEDULED else 'معطّلة'}\n"
         f"📨 إشعارات الفشل: {'مفعّلة' if TELEGRAM_NOTIFY_FAILURES else 'معطّلة'}"
     )
