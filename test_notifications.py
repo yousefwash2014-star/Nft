@@ -13,7 +13,7 @@ print("notification diagnostics checks passed")
 def test_pending_notification_is_present():
     source = open("main.py", encoding="utf-8").read()
     assert "build_pending_msg" in source
-    assert "broadcast-pending:" in source
+    assert "TELEGRAM_NOTIFY_PENDING = False" in source
+    assert "إشعارات Telegram: <b>البدء والشراء الناجح فقط</b>" in source
     assert "📤 إشعار البث والتأكيد" in source
-    assert "confirmed-failure:" in source
     assert "استثناء غير معالج في مهمة المحفظة" in source

@@ -149,6 +149,7 @@ BOT_ENABLED = True  # الأسرار فقط من بيئة الاستضافة
 CHECK_TWITTER = True  # لا يتم تنفيذ أي منت بدون حساب X مرتبط بالمجموعة
 ENABLE_UNIVERSAL_MINTS = False
 TELEGRAM_NOTIFY_FAILURES = False
+TELEGRAM_NOTIFY_PENDING = False
 VERIFY_ONCHAIN_PRICE = True
 SKIP_BALANCE_CHECK_RACE = False
 FIXED_GAS_LIMIT = 0
@@ -620,12 +621,6 @@ async def execute_race(race: ScheduledRace, plans: list[RacePlan]):
                 result.setdefault("attempt_mode", "race")
                 reason = result.get("reason", "")
                 if reason == "tx_pending" and result.get("tx_hash"):
-                    result["wallet"] = plan.wallet_address
-                    enqueue_message(
-                        bot_tok, chat_id,
-                        build_pending_msg(race.detail, result, race.chain_key, wallet_name),
-                        source=f"race-broadcast-pending:{race.slug}",
-                    )
                     pending_transactions[f"{race.chain_key}:{race.slug}:{plan.wallet_address.lower()}"] = {
                         "tx_hash": result["tx_hash"], "chain_key": race.chain_key,
                         "slug": race.slug, "wallet": plan.wallet_address,
@@ -1121,10 +1116,7 @@ async def execute_wallet_task(
     else:
         reason = result.get("reason", "")
         if reason == "tx_pending" and result.get("tx_hash"):
-            enqueue_message(
-                bot_tok, chat_id, build_pending_msg(detail, result, chain_key, w_name),
-                source=f"broadcast-pending:{slug}",
-            )
+            # تسجيل المعاملة للمصالحة فقط؛ إشعارات Telegram مقتصرة على البدء والنجاح.
             pending_transactions[pending_key] = {
                 "tx_hash": result["tx_hash"], "chain_key": chain_key,
                 "slug": slug, "wallet": wallet_addr,
@@ -1613,23 +1605,7 @@ async def reconcile_pending_transactions():
                 elif status == 0:
                     pending_transactions.pop(key, None)
                     release_wallet_operation(item["chain_key"], item["slug"], item["wallet"])
-                    failed_result = {
-                        "success": False,
-                        "reason": "tx_reverted",
-                        "tx_hash": item["tx_hash"],
-                        "error": "transaction reverted on-chain",
-                        "wallet": item["wallet"],
-                        "attempt_mode": item.get("attempt_mode", "confirmed"),
-                    }
-                    enqueue_message(
-                        item.get("bot_token", ""), item.get("chat_id", ""),
-                        build_fail_msg(
-                            item.get("detail", {}), failed_result,
-                            item["chain_key"], item.get("wallet_name", "المحفظة"),
-                        ),
-                        source=f"confirmed-failure:{item['slug']}",
-                    )
-                    log.warning("⚠️ فشلت المعاملة المعلّقة؛ أُرسل إشعار الفشل: %s", item["tx_hash"])
+                    log.warning("⚠️ فشلت المعاملة المعلّقة؛ بدون إشعار Telegram حسب الإعداد: %s", item["tx_hash"])
             except Exception:
                 # لا نحذف السجل عند فشل RPC؛ الإرسال السابق قد يكون ما زال صالحًا.
                 continue
@@ -1710,9 +1686,7 @@ async def run():
         f"𝕏 فحص X: <b>{x_status}</b>\n"
         f"𝕏 فحص X API المتقدم: <b>{x_api_status}</b>\n"
         f"🔁 إعادة Elysium قبل البث: <b>{ELYSIUM_AUTO_RETRY_ATTEMPTS} محاولات</b>\n"
-        f"📤 إشعار البث والتأكيد: <b>مفعّل</b>\n"
-        f"📨 إشعارات الجدولة: {'مفعّلة' if NOTIFY_SCHEDULED else 'معطّلة'}\n"
-        f"📨 إشعارات الفشل: {'مفعّلة' if TELEGRAM_NOTIFY_FAILURES else 'معطّلة'}"
+        f"📨 إشعارات Telegram: <b>البدء والشراء الناجح فقط</b>"
     )
     broadcast_message(welcome_msg, source="startup")
     log.info("🚀 Bot started | mode=%s | profile=%s | scan=%.2fs | concurrency=%d | chains=%s | wallets=%d",
