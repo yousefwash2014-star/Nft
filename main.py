@@ -149,7 +149,6 @@ BOT_ENABLED = True  # الأسرار فقط من بيئة الاستضافة
 CHECK_TWITTER = True  # لا يتم تنفيذ أي منت بدون حساب X مرتبط بالمجموعة
 ENABLE_UNIVERSAL_MINTS = False
 TELEGRAM_NOTIFY_FAILURES = False
-TELEGRAM_NOTIFY_PENDING = False
 VERIFY_ONCHAIN_PRICE = True
 SKIP_BALANCE_CHECK_RACE = False
 FIXED_GAS_LIMIT = 0
@@ -998,25 +997,6 @@ def build_success_msg(detail: dict, result: dict, chain_key: str, wallet_name: s
     ).strip()
 
 
-def build_pending_msg(detail: dict, result: dict, chain_key: str, wallet_name: str) -> str:
-    name = esc(detail.get("collection_name") or detail.get("collection_slug") or "Unknown")
-    chain_label = esc(CHAINS_CONFIG.get(chain_key, {}).get("chain_name_display", chain_key.upper()))
-    wallet_addr = result.get("wallet", "") or ""
-    w_short = esc(wallet_addr[:6] + "..." + wallet_addr[-4:]) if len(wallet_addr) >= 10 else esc(wallet_addr)
-    tx_hash = result.get("tx_hash", "") or ""
-    tmpl = CHAINS_CONFIG.get(chain_key, {}).get("explorer_url", "")
-    tx_url = tmpl.format(tx=tx_hash) if tmpl and tx_hash else ""
-    tx_link = f'<a href="{esc(tx_url)}">فتح المعاملة</a>' if tx_url else f"<code>{esc(tx_hash)}</code>"
-    return (
-        f"📤 <b>تم بث المعاملة — بانتظار التأكيد</b> ({chain_label})\n\n"
-        f"👤 المحفظة: <b>{esc(wallet_name)}</b> (<code>{w_short}</code>)\n"
-        f"🎨 المجموعة: <b>{name}</b>\n"
-        f"🧾 المعاملة: {tx_link}\n"
-        f"🔑 <code>{esc(tx_hash)}</code>\n"
-        f"ℹ️ سيتم إرسال إشعار نجاح بعد تأكيد الشبكة."
-    )
-
-
 def build_fail_msg(detail: dict, result: dict, chain_key: str, wallet_name: str) -> str:
     name = esc(detail.get("collection_name") or detail.get("collection_slug") or "Unknown")
     chain_label = esc(CHAINS_CONFIG.get(chain_key, {}).get("chain_name_display", chain_key.upper()))
@@ -1116,7 +1096,6 @@ async def execute_wallet_task(
     else:
         reason = result.get("reason", "")
         if reason == "tx_pending" and result.get("tx_hash"):
-            # تسجيل المعاملة للمصالحة فقط؛ إشعارات Telegram مقتصرة على البدء والنجاح.
             pending_transactions[pending_key] = {
                 "tx_hash": result["tx_hash"], "chain_key": chain_key,
                 "slug": slug, "wallet": wallet_addr,
@@ -1376,14 +1355,7 @@ async def evaluate_and_execute_mint(session: aiohttp.ClientSession, slug: str, c
             )
             for w in pending_wallets
         ]
-        task_results = await asyncio.gather(*tasks, return_exceptions=True)
-        for wallet, task_result in zip(pending_wallets, task_results):
-            if isinstance(task_result, Exception):
-                log.error(
-                    "❌ استثناء غير معالج في مهمة المحفظة %s/%s: %s",
-                    chain_key, wallet.get("name", wallet.get("address", "?")), task_result,
-                    exc_info=(type(task_result), task_result, task_result.__traceback__),
-                )
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     except Exception as e:
         log.error(f"خطأ تقييم '{slug}': {e}")
@@ -1605,7 +1577,7 @@ async def reconcile_pending_transactions():
                 elif status == 0:
                     pending_transactions.pop(key, None)
                     release_wallet_operation(item["chain_key"], item["slug"], item["wallet"])
-                    log.warning("⚠️ فشلت المعاملة المعلّقة؛ بدون إشعار Telegram حسب الإعداد: %s", item["tx_hash"])
+                    log.warning("⚠️ فشلت المعاملة المعلّقة؛ سيسمح بإعادة المحاولة: %s", item["tx_hash"])
             except Exception:
                 # لا نحذف السجل عند فشل RPC؛ الإرسال السابق قد يكون ما زال صالحًا.
                 continue
@@ -1686,7 +1658,8 @@ async def run():
         f"𝕏 فحص X: <b>{x_status}</b>\n"
         f"𝕏 فحص X API المتقدم: <b>{x_api_status}</b>\n"
         f"🔁 إعادة Elysium قبل البث: <b>{ELYSIUM_AUTO_RETRY_ATTEMPTS} محاولات</b>\n"
-        f"📨 إشعارات Telegram: <b>البدء والشراء الناجح فقط</b>"
+        f"📨 إشعارات الجدولة: {'مفعّلة' if NOTIFY_SCHEDULED else 'معطّلة'}\n"
+        f"📨 إشعارات الفشل: {'مفعّلة' if TELEGRAM_NOTIFY_FAILURES else 'معطّلة'}"
     )
     broadcast_message(welcome_msg, source="startup")
     log.info("🚀 Bot started | mode=%s | profile=%s | scan=%.2fs | concurrency=%d | chains=%s | wallets=%d",
