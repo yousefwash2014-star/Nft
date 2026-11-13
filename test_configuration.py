@@ -31,3 +31,10 @@ from stage_policy import stage_rejection_reason
 assert stage_rejection_reason({"name": "Public Stage", "type": "public", "allowlist": {"id": "old"}}) is None
 assert stage_rejection_reason({"name": "Whitelist", "type": "allowlist"}) is not None
 assert stage_rejection_reason({"name": "Public Stage", "eligibility": {"status": "eligible"}, "allowlist": {"id": "old"}}) is None
+
+
+def test_chain_gas_caps():
+    source = open("buyer.py", encoding="utf-8").read()
+    assert '"ethereum": 0.50' in source
+    assert '"elysium":   0.10' in source
+    assert 'RACE_MAX_GAS_FEE_USD_FALLBACK = 0.10' in source

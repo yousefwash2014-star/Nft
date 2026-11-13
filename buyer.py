@@ -326,10 +326,11 @@ DEFAULT_GAS_CAP_BY_CHAIN: dict[str, float] = {
     "ethereum": 0.50,
     "robinhood": 0.10,
     "ink":       0.10,
-    "arc":       0.05,
+    "arc":       0.10,
+    "elysium":   0.10,
 }
 
-RACE_MAX_GAS_FEE_USD_FALLBACK = 0.20
+RACE_MAX_GAS_FEE_USD_FALLBACK = 0.10
 
 
 def _resolve_gas_cap(chain_name: str) -> float:
@@ -346,6 +347,17 @@ CHAIN_GAS_CAPS: dict[str, float] = {
 
 def get_chain_gas_cap(chain_name: str) -> float:
     return CHAIN_GAS_CAPS.get(chain_name, RACE_MAX_GAS_FEE_USD_FALLBACK)
+
+
+def get_gas_cap_for_web3(w3: Web3, chain_name: str = "") -> float:
+    """حد الرسوم الفعلي حسب الشبكة؛ Ethereum فقط يبقى عند 0.50$."""
+    resolved = chain_name or ""
+    if not resolved:
+        try:
+            resolved = CHAIN_NAME_BY_ID.get(int(w3.eth.chain_id), "")
+        except Exception:
+            resolved = ""
+    return get_chain_gas_cap(resolved)
 
 
 log.info(
@@ -1073,6 +1085,13 @@ def attempt_purchase_seadrop(
     except Exception as e:
         return {"success": False, "reason": "invalid_address", "error": str(e)}
 
+    chain_name = chain_name or ""
+    try:
+        chain_name = chain_name or CHAIN_NAME_BY_ID.get(int(w3.eth.chain_id), "")
+    except Exception:
+        pass
+    gas_cap_usd = get_gas_cap_for_web3(w3, chain_name)
+
     preflight = preflight or {}
     balance_usd = float(preflight.get("balance_usd", -1.0))
     if not preflight and not SKIP_BALANCE_CHECK_RACE:
@@ -1085,8 +1104,8 @@ def attempt_purchase_seadrop(
     gas_fee_usd = float(preflight.get("gas_fee_usd", 0.0))
     if not preflight:
         gas_fee_usd = estimate_gas_fee_usd(w3, eth_price_usd)
-        if gas_fee_usd > MAX_GAS_FEE_USD:
-            return {"success": False, "reason": "gas_too_high", "gas_fee_usd": gas_fee_usd}
+        if gas_fee_usd > gas_cap_usd:
+            return {"success": False, "reason": "gas_too_high", "gas_fee_usd": gas_fee_usd, "gas_cap_usd": gas_cap_usd}
 
     fee_recipient = get_fee_recipient(w3, checksum_seadrop, checksum_contract) or checksum_seadrop
 
@@ -1094,11 +1113,6 @@ def attempt_purchase_seadrop(
     # بدون هذا الفحص قد يحاول البوت سك 15 إضافية لمحفظة سكّت 15 سابقًا،
     # فتعود المعاملة بخطأ MintQuantityExceedsMaxMintedPerWallet.
     effective_max_per_wallet = max_per_wallet
-    chain_name = chain_name or ""
-    try:
-        chain_name = chain_name or CHAIN_NAME_BY_ID.get(int(w3.eth.chain_id), "")
-    except Exception:
-        pass
     owned_balance = preflight.get("owned_balance") if preflight else get_wallet_ownership_balance(w3, checksum_contract, checksum_wallet, chain_name)
     if REQUIRE_OWNERSHIP_CHECK and owned_balance is None:
         return {"success": False, "reason": "ownership_check_unavailable",
@@ -1181,8 +1195,8 @@ def attempt_purchase_seadrop(
 
         gas_fee_eth = (tx["gas"] * priority_gas_price) / 1e18
         gas_fee_usd_actual = gas_fee_eth * eth_price_usd
-        if gas_fee_usd_actual > MAX_GAS_FEE_USD:
-            return {"success": False, "reason": "gas_too_high_precise", "gas_fee_usd": gas_fee_usd_actual}
+        if gas_fee_usd_actual > gas_cap_usd:
+            return {"success": False, "reason": "gas_too_high_precise", "gas_fee_usd": gas_fee_usd_actual, "gas_cap_usd": gas_cap_usd}
 
         signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
         raw_tx = getattr(signed_tx, "raw_transaction", None) or getattr(signed_tx, "rawTransaction", None)
@@ -1320,8 +1334,8 @@ def attempt_purchase_universal(
                     estimated_gas = w3.eth.estimate_gas(tx)
                     tx["gas"] = int(estimated_gas * GAS_LIMIT_SAFETY_MARGIN)
                     gas_fee_usd = tx["gas"] * priority_gas_price / 1e18 * eth_price_usd
-                    if gas_fee_usd > MAX_GAS_FEE_USD:
-                        return {"success": False, "reason": "gas_too_high_precise", "gas_fee_usd": gas_fee_usd}
+                    if gas_fee_usd > get_chain_gas_cap(CHAIN_NAME_BY_ID.get(current_chain_id, "")):
+                        return {"success": False, "reason": "gas_too_high_precise", "gas_fee_usd": gas_fee_usd, "gas_cap_usd": get_chain_gas_cap(CHAIN_NAME_BY_ID.get(current_chain_id, ""))}
                     signed_tx = w3.eth.account.sign_transaction(tx, private_key=private_key)
                     raw_tx = getattr(signed_tx, "raw_transaction", None) or getattr(signed_tx, "rawTransaction", None)
                     _rpc_limiter.acquire()
@@ -1409,8 +1423,9 @@ def attempt_purchase_drop_api(
         except Exception as simulation_error:
             return {"success": False, "reason": "simulation_failed", "error": str(simulation_error)}
         gas_fee_usd = tx["gas"] * gas_price / 1e18 * eth_price_usd
-        if gas_fee_usd > MAX_GAS_FEE_USD:
-            return {"success": False, "reason": "gas_too_high_precise", "gas_fee_usd": gas_fee_usd}
+        gas_cap_usd = get_gas_cap_for_web3(w3)
+        if gas_fee_usd > gas_cap_usd:
+            return {"success": False, "reason": "gas_too_high_precise", "gas_fee_usd": gas_fee_usd, "gas_cap_usd": gas_cap_usd}
         signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
         raw_tx = getattr(signed, "raw_transaction", None) or getattr(signed, "rawTransaction", None)
         _rpc_limiter.acquire()
@@ -1521,8 +1536,9 @@ def execute_purchase_pipeline(
     if balance_usd < MIN_BALANCE_RESERVE_USD:
         return {"success": False, "reason": "balance_too_low", "balance_usd": balance_usd, "attempt_mode": "normal_checked"}
     gas_fee_usd = estimate_gas_fee_usd(w3, eth_price_usd)
-    if gas_fee_usd > MAX_GAS_FEE_USD:
-        return {"success": False, "reason": "gas_too_high", "balance_usd": balance_usd, "gas_fee_usd": gas_fee_usd, "attempt_mode": "normal_checked"}
+    gas_cap_usd = get_gas_cap_for_web3(w3, chain_name)
+    if gas_fee_usd > gas_cap_usd:
+        return {"success": False, "reason": "gas_too_high", "balance_usd": balance_usd, "gas_fee_usd": gas_fee_usd, "gas_cap_usd": gas_cap_usd, "attempt_mode": "normal_checked"}
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         ownership_future = pool.submit(get_wallet_ownership_balance, w3, nft_contract, wallet_address, chain_name)
